@@ -19,7 +19,7 @@
 #else
   static const int ydbLogLevel = YDB_LOG_LEVEL_WARN;
 #endif
-
+#pragma unused(ydbLogLevel)
 
 
 @implementation YapDatabaseFullTextSearchConnection {
@@ -31,16 +31,18 @@
 	sqlite3_stmt *removeAllStatement;
 	sqlite3_stmt *queryStatement;
 	sqlite3_stmt *querySnippetStatement;
+	sqlite3_stmt *rowidQueryStatement;
+	sqlite3_stmt *rowidQuerySnippetStatement;
 }
 
-@synthesize fullTextSearch = fts;
+@synthesize fullTextSearch = parent;
 
-- (id)initWithFTS:(YapDatabaseFullTextSearch *)inFTS
-   databaseConnection:(YapDatabaseConnection *)inDatabaseConnection
+- (id)initWithParent:(YapDatabaseFullTextSearch *)inParent
+  databaseConnection:(YapDatabaseConnection *)inDatabaseConnection
 {
 	if ((self = [super init]))
 	{
-		fts = inFTS;
+		parent = inParent;
 		databaseConnection = inDatabaseConnection;
 	}
 	return self;
@@ -48,27 +50,29 @@
 
 - (void)dealloc
 {
+	[self _flushStatements];
+}
+
+- (void)_flushStatements
+{
 	sqlite_finalize_null(&insertRowidStatement);
 	sqlite_finalize_null(&setRowidStatement);
 	sqlite_finalize_null(&removeRowidStatement);
 	sqlite_finalize_null(&removeAllStatement);
 	sqlite_finalize_null(&queryStatement);
 	sqlite_finalize_null(&querySnippetStatement);
+	sqlite_finalize_null(&rowidQueryStatement);
+	sqlite_finalize_null(&rowidQuerySnippetStatement);
 }
 
 /**
  * Required override method from YapDatabaseExtensionConnection
 **/
-- (void)_flushMemoryWithLevel:(int)level
+- (void)_flushMemoryWithFlags:(YapDatabaseConnectionFlushMemoryFlags)flags
 {
-	if (level >= YapDatabaseConnectionFlushMemoryLevelModerate)
+	if (flags & YapDatabaseConnectionFlushMemoryFlags_Statements)
 	{
-		sqlite_finalize_null(&insertRowidStatement);
-		sqlite_finalize_null(&setRowidStatement);
-		sqlite_finalize_null(&removeRowidStatement);
-		sqlite_finalize_null(&removeAllStatement);
-		sqlite_finalize_null(&queryStatement);
-		sqlite_finalize_null(&querySnippetStatement);
+		[self _flushStatements];
 	}
 }
 
@@ -81,7 +85,7 @@
 **/
 - (YapDatabaseExtension *)extension
 {
-	return fts;
+	return parent;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -94,8 +98,8 @@
 - (id)newReadTransaction:(YapDatabaseReadTransaction *)databaseTransaction
 {
 	YapDatabaseFullTextSearchTransaction *transaction =
-	  [[YapDatabaseFullTextSearchTransaction alloc] initWithFTSConnection:self
-	                                                  databaseTransaction:databaseTransaction];
+	  [[YapDatabaseFullTextSearchTransaction alloc] initWithParentConnection:self
+	                                                     databaseTransaction:databaseTransaction];
 	
 	return transaction;
 }
@@ -106,12 +110,10 @@
 - (id)newReadWriteTransaction:(YapDatabaseReadWriteTransaction *)databaseTransaction
 {
 	YapDatabaseFullTextSearchTransaction *transaction =
-	  [[YapDatabaseFullTextSearchTransaction alloc] initWithFTSConnection:self
-	                                                  databaseTransaction:databaseTransaction];
+	  [[YapDatabaseFullTextSearchTransaction alloc] initWithParentConnection:self
+	                                                     databaseTransaction:databaseTransaction];
 	
-	if (blockDict == nil)
-		blockDict = [NSMutableDictionary dictionaryWithSharedKeySet:fts->columnNamesSharedKeySet];
-	
+	[self prepareForReadWriteTransaction];
 	return transaction;
 }
 
@@ -120,11 +122,33 @@
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 /**
+ * Initializes any ivars that a read-write transaction may need.
+**/
+- (void)prepareForReadWriteTransaction
+{
+	if (blockDict == nil)
+		blockDict = [NSMutableDictionary dictionaryWithSharedKeySet:parent->columnNamesSharedKeySet];
+	
+	if (mutationStack == nil)
+		mutationStack = [[YapMutationStack_Bool alloc] init];
+}
+
+- (void)postCommitCleanup
+{
+	[mutationStack clear];
+}
+
+- (void)postRollbackCleanup
+{
+	[mutationStack clear];
+}
+
+/**
  * Required override method from YapDatabaseExtensionConnection
 **/
-- (void)getInternalChangeset:(NSMutableDictionary **)internalChangesetPtr
-           externalChangeset:(NSMutableDictionary **)externalChangesetPtr
-              hasDiskChanges:(BOOL *)hasDiskChangesPtr
+- (void)getInternalChangeset:(NSMutableDictionary __unused **)internalChangesetPtr
+           externalChangeset:(NSMutableDictionary __unused **)externalChangesetPtr
+              hasDiskChanges:(BOOL __unused *)hasDiskChangesPtr
 {
 	// Nothing to do for this particular extension.
 	//
@@ -135,7 +159,7 @@
 /**
  * Required override method from YapDatabaseExtensionConnection
 **/
-- (void)processChangeset:(NSDictionary *)changeset
+- (void)processChangeset:(NSDictionary __unused *)changeset
 {
 	// Nothing to do for this particular extension.
 	//
@@ -149,19 +173,20 @@
 
 - (sqlite3_stmt *)insertRowidStatement
 {
-	if (insertRowidStatement == NULL)
+	sqlite3_stmt **statement = &insertRowidStatement;
+	if (*statement == NULL)
 	{
 		NSMutableString *string = [NSMutableString stringWithCapacity:100];
-		[string appendFormat:@"INSERT INTO \"%@\" (\"rowid\"", [fts tableName]];
+		[string appendFormat:@"INSERT INTO \"%@\" (\"rowid\"", [parent tableName]];
 		
-		for (NSString *columnName in fts->columnNames)
+		for (NSString *columnName in parent->columnNames)
 		{
 			[string appendFormat:@", \"%@\"", columnName];
 		}
 		
 		[string appendString:@") VALUES (?"];
 		
-		NSUInteger count = [fts->columnNames count];
+		NSUInteger count = [parent->columnNames count];
 		NSUInteger i;
 		for (i = 0; i < count; i++)
 		{
@@ -172,31 +197,32 @@
 		
 		sqlite3 *db = databaseConnection->db;
 		
-		int status = sqlite3_prepare_v2(db, [string UTF8String], -1, &insertRowidStatement, NULL);
+		int status = sqlite3_prepare_v2(db, [string UTF8String], -1, statement, NULL);
 		if (status != SQLITE_OK)
 		{
 			YDBLogError(@"%@: Error creating prepared statement: %d %s", THIS_METHOD, status, sqlite3_errmsg(db));
 		}
 	}
 	
-	return insertRowidStatement;
+	return *statement;
 }
 
 - (sqlite3_stmt *)setRowidStatement
 {
-	if (setRowidStatement == NULL)
+	sqlite3_stmt **statement = &setRowidStatement;
+	if (*statement == NULL)
 	{
 		NSMutableString *string = [NSMutableString stringWithCapacity:100];
-		[string appendFormat:@"INSERT OR REPLACE INTO \"%@\" (\"rowid\"", [fts tableName]];
+		[string appendFormat:@"INSERT OR REPLACE INTO \"%@\" (\"rowid\"", [parent tableName]];
 		
-		for (NSString *columnName in fts->columnNames)
+		for (NSString *columnName in parent->columnNames)
 		{
 			[string appendFormat:@", \"%@\"", columnName];
 		}
 		
 		[string appendString:@") VALUES (?"];
 		
-		NSUInteger count = [fts->columnNames count];
+		NSUInteger count = [parent->columnNames count];
 		NSUInteger i;
 		for (i = 0; i < count; i++)
 		{
@@ -207,92 +233,134 @@
 		
 		sqlite3 *db = databaseConnection->db;
 		
-		int status = sqlite3_prepare_v2(db, [string UTF8String], -1, &setRowidStatement, NULL);
+		int status = sqlite3_prepare_v2(db, [string UTF8String], -1, statement, NULL);
 		if (status != SQLITE_OK)
 		{
 			YDBLogError(@"%@: Error creating prepared statement: %d %s", THIS_METHOD, status, sqlite3_errmsg(db));
 		}
 	}
 	
-	return setRowidStatement;
+	return *statement;
 }
 
 - (sqlite3_stmt *)removeRowidStatement
 {
-	if (removeRowidStatement == NULL)
+	sqlite3_stmt **statement = &removeRowidStatement;
+	if (*statement == NULL)
 	{
-		NSString *string = [NSString stringWithFormat:@"DELETE FROM \"%@\" WHERE \"rowid\" = ?;", [fts tableName]];
+		NSString *string = [NSString stringWithFormat:@"DELETE FROM \"%@\" WHERE \"rowid\" = ?;", [parent tableName]];
 		
 		sqlite3 *db = databaseConnection->db;
 		
-		int status = sqlite3_prepare_v2(db, [string UTF8String], -1, &removeRowidStatement, NULL);
+		int status = sqlite3_prepare_v2(db, [string UTF8String], -1, statement, NULL);
 		if (status != SQLITE_OK)
 		{
 			YDBLogError(@"%@: Error creating prepared statement: %d %s", THIS_METHOD, status, sqlite3_errmsg(db));
 		}
 	}
 	
-	return removeRowidStatement;
+	return *statement;
 }
 
 - (sqlite3_stmt *)removeAllStatement
 {
-	if (removeAllStatement == NULL)
+	sqlite3_stmt **statement = &removeAllStatement;
+	if (*statement == NULL)
 	{
-		NSString *string = [NSString stringWithFormat:@"DELETE FROM \"%@\";", [fts tableName]];
+		NSString *string = [NSString stringWithFormat:@"DELETE FROM \"%@\";", [parent tableName]];
 		
 		sqlite3 *db = databaseConnection->db;
 		
-		int status = sqlite3_prepare_v2(db, [string UTF8String], -1, &removeAllStatement, NULL);
+		int status = sqlite3_prepare_v2(db, [string UTF8String], -1, statement, NULL);
 		if (status != SQLITE_OK)
 		{
 			YDBLogError(@"%@: Error creating prepared statement: %d %s", THIS_METHOD, status, sqlite3_errmsg(db));
 		}
 	}
 	
-	return removeAllStatement;
+	return *statement;
 }
 
 - (sqlite3_stmt *)queryStatement
 {
-	if (queryStatement == NULL)
+	sqlite3_stmt **statement = &queryStatement;
+	if (*statement == NULL)
 	{
-		NSString *tableName = [fts tableName];
-		
 		NSString *string = [NSString stringWithFormat:
-		    @"SELECT \"rowid\" FROM \"%1$@\" WHERE \"%1$@\" MATCH ?;", tableName];
+		  @"SELECT \"rowid\" FROM \"%1$@\" WHERE \"%1$@\" MATCH ?;", [parent tableName]];
 		
 		sqlite3 *db = databaseConnection->db;
 		
-		int status = sqlite3_prepare_v2(db, [string UTF8String], -1, &queryStatement, NULL);
+		int status = sqlite3_prepare_v2(db, [string UTF8String], -1, statement, NULL);
 		if (status != SQLITE_OK)
 		{
 			YDBLogError(@"%@: Error creating prepared statement: %d %s", THIS_METHOD, status, sqlite3_errmsg(db));
 		}
 	}
 	
-	return queryStatement;
+	return *statement;
 }
 
 - (sqlite3_stmt *)querySnippetStatement
 {
-	if (querySnippetStatement == NULL)
+	sqlite3_stmt **statement = &querySnippetStatement;
+	if (*statement == NULL)
 	{
-		NSString *tableName = [fts tableName];
-		
 		NSString *string = [NSString stringWithFormat:
-		    @"SELECT \"rowid\", snippet(\"%1$@\", ?, ?, ?, ?, ?) FROM \"%1$@\" WHERE \"%1$@\" MATCH ?;", tableName];
+		  @"SELECT \"rowid\", snippet(\"%1$@\", ?, ?, ?, ?, ?) FROM \"%1$@\" WHERE \"%1$@\" MATCH ?;",
+		  [parent tableName]];
 		
 		sqlite3 *db = databaseConnection->db;
 		
-		int status = sqlite3_prepare_v2(db, [string UTF8String], -1, &querySnippetStatement, NULL);
+		int status = sqlite3_prepare_v2(db, [string UTF8String], -1, statement, NULL);
 		if (status != SQLITE_OK)
 		{
 			YDBLogError(@"%@: Error creating prepared statement: %d %s", THIS_METHOD, status, sqlite3_errmsg(db));
 		}
 	}
 	
-	return querySnippetStatement;
+	return *statement;
+}
+
+- (sqlite3_stmt *)rowidQueryStatement
+{
+	sqlite3_stmt **statement = &rowidQueryStatement;
+	if (*statement == NULL)
+	{
+		NSString *string = [NSString stringWithFormat:
+		  @"SELECT \"rowid\" FROM \"%1$@\" WHERE \"rowid\" = ? AND \"%1$@\" MATCH ?;", [parent tableName]];
+		
+		sqlite3 *db = databaseConnection->db;
+		
+		int status = sqlite3_prepare_v2(db, [string UTF8String], -1, statement, NULL);
+		if (status != SQLITE_OK)
+		{
+			YDBLogError(@"%@: Error creating prepared statement: %d %s", THIS_METHOD, status, sqlite3_errmsg(db));
+		}
+	}
+	
+	return *statement;
+}
+
+- (sqlite3_stmt *)rowidQuerySnippetStatement
+{
+	sqlite3_stmt **statement = &rowidQuerySnippetStatement;
+	if (*statement == NULL)
+	{
+		NSString *string = [NSString stringWithFormat:
+		  @"SELECT \"rowid\", snippet(\"%1$@\", ?, ?, ?, ?, ?) FROM \"%1$@\" WHERE \"rowid\" = ? AND \"%1$@\" MATCH ?;",
+		  [parent tableName]];
+		
+		sqlite3 *db = databaseConnection->db;
+		
+		int status = sqlite3_prepare_v2(db, [string UTF8String], -1, statement, NULL);
+		if (status != SQLITE_OK)
+		{
+			YDBLogError(@"%@: Error creating prepared statement: %d %s", THIS_METHOD, status, sqlite3_errmsg(db));
+		}
+	}
+	
+	return *statement;
 }
 
 @end

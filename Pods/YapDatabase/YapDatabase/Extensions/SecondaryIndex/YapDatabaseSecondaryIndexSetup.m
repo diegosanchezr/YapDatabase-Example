@@ -14,7 +14,21 @@
 #else
   static const int ydbLogLevel = YDB_LOG_LEVEL_WARN;
 #endif
+#pragma unused(ydbLogLevel)
 
+
+NSString* NSStringFromYapDatabaseSecondaryIndexType(YapDatabaseSecondaryIndexType type)
+{
+	switch (type)
+	{
+		case YapDatabaseSecondaryIndexTypeInteger : return @"INTEGER";
+		case YapDatabaseSecondaryIndexTypeReal    : return @"REAL";
+		case YapDatabaseSecondaryIndexTypeNumeric : return @"NUMERIC";
+		case YapDatabaseSecondaryIndexTypeText    : return @"TEXT";
+		case YapDatabaseSecondaryIndexTypeBlob    : return @"BLOB";
+		default                                   : return @"UNKNOWN";
+	}
+}
 
 @interface YapDatabaseSecondaryIndexColumn ()
 - (id)initWithName:(NSString *)name type:(YapDatabaseSecondaryIndexType)type;
@@ -109,7 +123,9 @@
 	
 	if (type != YapDatabaseSecondaryIndexTypeInteger &&
 	    type != YapDatabaseSecondaryIndexTypeReal    &&
-	    type != YapDatabaseSecondaryIndexTypeText)
+	    type != YapDatabaseSecondaryIndexTypeNumeric &&
+	    type != YapDatabaseSecondaryIndexTypeText    &&
+	    type != YapDatabaseSecondaryIndexTypeBlob     )
 	{
 		NSAssert(NO, @"Invalid type");
 		
@@ -130,7 +146,10 @@
 
 - (YapDatabaseSecondaryIndexColumn *)columnAtIndex:(NSUInteger)index
 {
-	return [setup objectAtIndex:index];
+	if (index < [setup count])
+		return [setup objectAtIndex:index];
+	else
+		return nil;
 }
 
 - (NSArray *)columnNames
@@ -145,7 +164,7 @@
 	return [columnNames copy];
 }
 
-- (id)copyWithZone:(NSZone *)zone
+- (id)copyWithZone:(NSZone __unused *)zone
 {
 	YapDatabaseSecondaryIndexSetup *copy = [[YapDatabaseSecondaryIndexSetup alloc] initForCopy];
 	copy->setup = [setup mutableCopy];
@@ -158,6 +177,59 @@
                                     count:(NSUInteger)length
 {
 	return [setup countByEnumeratingWithState:state objects:buffer count:length];
+}
+
+/**
+ * The columns parameter comes from:
+ * [YapDatabase columnNamesAndAffinityForTable:using:]
+**/
+- (BOOL)matchesExistingColumnNamesAndAffinity:(NSDictionary *)columns
+{
+	// The columns parameter will include the 'rowid' column, which we need to ignore.
+	
+	if (([setup count] + 1) != [columns count])
+	{
+		return NO;
+	}
+	
+	for (YapDatabaseSecondaryIndexColumn *setupColumn in setup)
+	{
+		NSString *existingAffinity = [columns objectForKey:setupColumn.name];
+		if (existingAffinity == nil)
+		{
+			return NO;
+		}
+		else
+		{
+			if (setupColumn.type == YapDatabaseSecondaryIndexTypeInteger)
+			{
+				if ([existingAffinity caseInsensitiveCompare:@"INTEGER"] != NSOrderedSame)
+					return NO;
+			}
+			else if (setupColumn.type == YapDatabaseSecondaryIndexTypeReal)
+			{
+				if ([existingAffinity caseInsensitiveCompare:@"REAL"] != NSOrderedSame)
+					return NO;
+			}
+			else if (setupColumn.type == YapDatabaseSecondaryIndexTypeNumeric)
+			{
+				if ([existingAffinity caseInsensitiveCompare:@"NUMERIC"] != NSOrderedSame)
+					return NO;
+			}
+			else if (setupColumn.type == YapDatabaseSecondaryIndexTypeText)
+			{
+				if ([existingAffinity caseInsensitiveCompare:@"TEXT"] != NSOrderedSame)
+					return NO;
+			}
+			else if (setupColumn.type == YapDatabaseSecondaryIndexTypeBlob)
+			{
+				if ([existingAffinity caseInsensitiveCompare:@"BLOB"] != NSOrderedSame)
+					return NO;
+			}
+		}
+	}
+	
+	return YES;
 }
 
 @end
@@ -179,6 +251,13 @@
 		type = inType;
 	}
 	return self;
+}
+
+- (NSString *)description
+{
+	NSString *typeStr = NSStringFromYapDatabaseSecondaryIndexType(type);
+	
+	return [NSString stringWithFormat:@"<YapDatabaseSecondaryIndexColumn: name(%@), type(%@)>", name, typeStr];
 }
 
 @end

@@ -3,19 +3,24 @@
 
 @class YapDatabaseReadTransaction;
 
+NS_ASSUME_NONNULL_BEGIN
+
 /**
  * Welcome to YapDatabase!
  *
- * https://github.com/yaptv/YapDatabase
+ * https://github.com/yapstudios/YapDatabase
  *
  * The project wiki has a wealth of documentation if you have any questions.
- * https://github.com/yaptv/YapDatabase/wiki
+ * https://github.com/yapstudios/YapDatabase/wiki
  *
  * YapDatabaseView is an extension designed to work with YapDatabase.
  * It gives you a persistent sorted "view" of a configurable subset of your data.
  *
  * For the full documentation on Views, please see the related wiki article:
- * https://github.com/yaptv/YapDatabase/wiki/Views
+ * https://github.com/yapstudios/YapDatabase/wiki/Views
+ * 
+ * There is also an entire section that details YapDatabaseViewMappings:
+ * https://github.com/yapstudios/YapDatabase/wiki/Views#mappings
  * 
  * YapDatabaseViewMappings helps you map from groups to sections.
  * Let's take a look at a concrete example:
@@ -34,8 +39,8 @@
  * Plus it can properly take into account empty sections. For example, if there are no items
  * for sale in the liquor department then it can automatically move beer to section 1 (optional).
  * 
- * But the primary purpose of this class has to do with assisting in animating changes to your view.
- * In order to provide the proper animation instructions to your tableView or collectionView,
+ * This class also assists you in animating changes to your tableView/collectionView.
+ * In order to provide the proper animation instructions to your UI,
  * the database layer needs to know a little about how you're setting things up.
  * 
  * Using the example above, we might have code that looks something like this:
@@ -114,12 +119,12 @@
  *     
  *     for (YapDatabaseViewSectionChange *sectionChange in sectionChanges)
  *     {
- *         // ... (see https://github.com/yaptv/YapDatabase/wiki/Views )
+ *         // ... (see https://github.com/yapstudios/YapDatabase/wiki/Views )
  *     }
  *     
  *     for (YapDatabaseViewRowChange *rowChange in rowChanges)
  *     {
- *         // ... (see https://github.com/yaptv/YapDatabase/wiki/Views )
+ *         // ... (see https://github.com/yapstudios/YapDatabase/wiki/Views )
  *     }
  *
  *     [self.tableView endUpdates];
@@ -144,21 +149,14 @@
  * 
  * - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath
  * {
- *     // If my sections are dynamic (they automatically come and go as individual sections become empty & non-empty),
- *     // then I can easily use the mappings object to find the appropriate group.
- *     
- *     NSString *group = [mappings groupForSection:indexPath.section];
- *
- *     __block id object = nil;
+ *      __block id object = nil;
  *     [databaseConnection readWithBlock:^(YapDatabaseReadTransaction *transaction){
  *         
- *         object = [[transaction ext:@"view"] objectAtIndex:indexPath.row inGroup:group];
+ *         object = [[transaction ext:@"view"] objectAtIndexPath:indexPath withMappings:mappings];
  *     }];
  * 
  *     // configure and return cell...
  * }
- *
- * @see YapDatabaseConnection getSectionChanges:rowChanges:forNotifications:withMappings:
 **/
 
 /**
@@ -173,11 +171,14 @@ struct YapDatabaseViewRangePosition {
 };
 typedef struct YapDatabaseViewRangePosition YapDatabaseViewRangePosition;
 
+typedef BOOL (^YapDatabaseViewMappingGroupFilter)(NSString *group, YapDatabaseReadTransaction *transaction);
+typedef NSComparisonResult (^YapDatabaseViewMappingGroupSort)(NSString *group1, NSString *group2, YapDatabaseReadTransaction *transaction);
 
 @interface YapDatabaseViewMappings : NSObject <NSCopying>
 
 /**
  * Initializes a new mappings object.
+ * Use this initializer when the groups, and their order, are known at initialization time.
  *
  * @param allGroups
  *     The ordered array of group names.
@@ -186,10 +187,13 @@ typedef struct YapDatabaseViewRangePosition YapDatabaseViewRangePosition;
  * @param registeredViewName
  *     This is the name of the view, as you registered it with the database system.
 **/
-+ (instancetype)mappingsWithGroups:(NSArray *)allGroups view:(NSString *)registeredViewName;
++ (instancetype)mappingsWithGroups:(NSArray<NSString *> *)allGroups view:(NSString *)registeredViewName;
+
+
 
 /**
- * Initializes a new mappings object.
+ * Initializes a new mappings object with a static list of groups.
+ * Use this initializer when the groups, and their order, are known at initialization time.
  * 
  * @param allGroups
  *     The ordered array of group names.
@@ -197,11 +201,24 @@ typedef struct YapDatabaseViewRangePosition YapDatabaseViewRangePosition;
  * 
  * @param registeredViewName
  *     This is the name of the view, as you registered it with the database system.
- * 
+**/
+- (id)initWithGroups:(NSArray<NSString *> *)allGroups
+				view:(NSString *)registeredViewName;
+
+
+/**
+ * Initializes a new mappings object that uses a filterBlock and a sortBlock to dynamically construct sections from view.
+ * @param filterBlock
+ *      Block that takes a string and returns a BOOL.  returning YES will include the group in the sections of the mapping.
+ * @param sortBlock
+ *      Block used to sort group names for groups that pass the filter.
+ * @param registeredViewName
+ *      This is the name of the view, as you registered it with the database system.
  *
 **/
-- (id)initWithGroups:(NSArray *)allGroups
-				view:(NSString *)registeredViewName;
+- (id)initWithGroupFilterBlock:(YapDatabaseViewMappingGroupFilter)filterBlock
+                     sortBlock:(YapDatabaseViewMappingGroupSort)sortBlock
+                          view:(NSString *)registeredViewName;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 #pragma mark Accessors
@@ -213,7 +230,7 @@ typedef struct YapDatabaseViewRangePosition YapDatabaseViewRangePosition;
  * 
  * @see visibleGroups
 **/
-@property (nonatomic, copy, readonly) NSArray *allGroups;
+@property (nonatomic, copy, readonly) NSArray<NSString *> *allGroups;
 
 /**
  * The registeredViewName that was passed in the init method.
@@ -253,7 +270,16 @@ typedef struct YapDatabaseViewRangePosition YapDatabaseViewRangePosition;
  * @see groupForSection:
  * @see visibleGroups
  * 
- * The mappings object is used with:
+ * Also note that there's an extremely helpful category: YapDatabaseViewTransaction(Mappings).
+ * Methods in this category will be of great help as you take advantage of advanced mappings configurations.
+ * For example:
+ *
+ * id object = [[transaction ext:@"myView"] objectAtIndexPath:indexPath withMappings:mappings];
+ *
+ * These methods are extensively unit tested to ensure they work properly with all kinds of mappings configurations.
+ * Translation: You can use them without thinking, and they'll just work everytime.
+ *
+ * The mappings object is also used to assist with tableView/collectionView change animations:
  *
  * - YapDatabaseViewConnection getSectionChanges:rowChanges:forNotifications:withMappings:
  * 
@@ -262,14 +288,25 @@ typedef struct YapDatabaseViewRangePosition YapDatabaseViewRangePosition;
  * As the dynamic sections disappear & re-appear, the proper section changes will be emitted.
  *
  * By DEFAULT, all groups/sections are STATIC.
- * You can configure this per group, or all-at-once.
+ *
+ * You can configure this however you want to meet your needs.
+ * This includes per-group configuration, all-at-once, and even overrides.
+ * 
+ * ORDER MATTERS.
+ *
+ * If you invoke setIsDynamicSectionForAllGroups, this sets the configuration for every group.
+ * Including future groups if using dynamic groups via initWithGroupFilterBlock:sortBlock:view:.
+ * 
+ * Once the configuration is set for all groups, you can then choose to provide overriden settings for select groups.
+ * That is, if you then invoke setIsDynamicSection:forGroup: is will override the "global" setting
+ * for this particular group.
 **/
-
-- (void)setIsDynamicSectionForAllGroups:(BOOL)isDynamic;
-- (BOOL)isDynamicSectionForAllGroups;
 
 - (void)setIsDynamicSection:(BOOL)isDynamic forGroup:(NSString *)group;
 - (BOOL)isDynamicSectionForGroup:(NSString *)group;
+
+- (void)setIsDynamicSectionForAllGroups:(BOOL)isDynamic;
+- (BOOL)isDynamicSectionForAllGroups;
 
 /**
  * You can use the YapDatabaseViewRangeOptions class to configure a "range" that you would
@@ -296,18 +333,15 @@ typedef struct YapDatabaseViewRangePosition YapDatabaseViewRangePosition;
  * You can get this with only a few lines of code using range options.
  * 
  * Note that if you're using range options, then the indexPaths in your UI might not match up directly
- * with the indexes in the view's group. No worries. You can use the various mapping methods in this class
- * to automatically handle all that for you.
- *
- * @see getGroup:viewIndex:forIndexPath:
- * @see viewIndexForRow:inSection:
- * @see viewIndexForRow:inGroup:
+ * with the indexes in the view's group. But don't worry.
+ * Just use the methods in "YapDatabaseViewTransaction (Mappings)" to automatically handle it all for you.
+ * Or, if you want to be advanced, the various mapping methods in this class.
  * 
  * The rangeOptions you pass in are copied, and YapDatabaseViewMappings keeps a private immutable version of them.
  * So if you make changes to the rangeOptions, you need to invoke this method again to set the changes.
 **/
 
-- (void)setRangeOptions:(YapDatabaseViewRangeOptions *)rangeOpts forGroup:(NSString *)group;
+- (void)setRangeOptions:(nullable YapDatabaseViewRangeOptions *)rangeOpts forGroup:(NSString *)group;
 - (YapDatabaseViewRangeOptions *)rangeOptionsForGroup:(NSString *)group;
 
 - (void)removeRangeOptionsForGroup:(NSString *)group;
@@ -352,8 +386,8 @@ typedef struct YapDatabaseViewRangePosition YapDatabaseViewRangePosition;
 
 - (void)setCellDrawingDependencyForNeighboringCellWithOffset:(NSInteger)offset forGroup:(NSString *)group;
 
-- (void)setCellDrawingDependencyOffsets:(NSSet *)offsets forGroup:(NSString *)group;
-- (NSSet *)cellDrawingDependencyOffsetsForGroup:(NSString *)group;
+- (void)setCellDrawingDependencyOffsets:(NSSet<NSNumber *> *)offsets forGroup:(NSString *)group;
+- (NSSet<NSNumber *> *)cellDrawingDependencyOffsetsForGroup:(NSString *)group;
 
 /**
  * You can tell mappings to reverse a group/section if you'd like to display it in your tableView/collectionView
@@ -467,17 +501,30 @@ typedef struct YapDatabaseViewRangePosition YapDatabaseViewRangePosition;
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 /**
- * You have to call this method to initialize the mappings.
+ * You have to call this method at least once to initialize the mappings.
  * This method uses the given transaction to fetch and cache the counts for each group.
  * 
- * This class is designed to be used with the method getSectionChanges:rowChanges:forNotifications:withMappings:.
- * That method needs the 'before' & 'after' snapshot of the mappings in order to calculate the proper changeset.
- * In order to get this, it automatically invokes this method.
- *
- * Thus you only have to manually invoke this method once.
- * Aftewards, it should be invoked for you.
+ * Mappings are implicitly tied to a databaseConnection's longLivedReadTransaction.
+ * That is, when you invoke [databaseConnection beginLongLivedReadTransaction] you are freezing the
+ * connection on a particular commit (a snapshot of the database at that point in time).
+ * Mappings must always be on the same snapshot as its corresponding databaseConnection.
  * 
- * Please see the example code above.
+ * Eventually, you move the databaseConnection to the latest commit.
+ * You do by invoking [databaseConnection beginLongLivedReadTransaction] again.
+ * And when you do this you MUST ensure the mappings are also updated to match the databaseConnection's new snapshot.
+ *
+ * There are 2 ways to do this:
+ *
+ * - Invoke getSectionChanges:rowChanges:forNotifications:withMappings:.
+ *   That method requires the 'before' & 'after' snapshot of the mappings in order to calculate the proper changeset.
+ *   And in order to get this, it automatically invokes this method.
+ *
+ * - Invoke this method again.
+ *   And do NOT invoke getSectionChanges:rowChanges:forNotifications:withMappings:.
+ *   You might take this route if the viewController isn't visible,
+ *   and you're simply planning on doing a [tableView reloadData].
+ * 
+ * Please also see the example code above.
 **/
 - (void)updateWithTransaction:(YapDatabaseReadTransaction *)transaction;
 
@@ -542,7 +589,7 @@ typedef struct YapDatabaseViewRangePosition YapDatabaseViewRangePosition;
 - (BOOL)isEmpty;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-#pragma mark Mapping: UI -> View
+#pragma mark Mapping: UI -> YapDatabaseView
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 /**
@@ -588,7 +635,7 @@ typedef struct YapDatabaseViewRangePosition YapDatabaseViewRangePosition;
  *     // configure and return cell...
  * }
 **/
-- (BOOL)getGroup:(NSString **)groupPtr index:(NSUInteger *)indexPtr forIndexPath:(NSIndexPath *)indexPath;
+- (BOOL)getGroup:(NSString * _Nonnull * _Nullable)groupPtr index:(nullable NSUInteger *)indexPtr forIndexPath:(NSIndexPath *)indexPath;
 
 /**
  * Maps from an indexPath (in the UI) to a group & index (within the View).
@@ -623,8 +670,8 @@ typedef struct YapDatabaseViewRangePosition YapDatabaseViewRangePosition;
  *     // configure and return cell...
  * }
 **/
-- (BOOL)getGroup:(NSString **)groupPtr
-           index:(NSUInteger *)indexPtr
+- (BOOL)getGroup:(NSString * _Nonnull * _Nullable)groupPtr
+           index:(nullable NSUInteger *)indexPtr
           forRow:(NSUInteger)row
        inSection:(NSUInteger)section;
 
@@ -649,7 +696,7 @@ typedef struct YapDatabaseViewRangePosition YapDatabaseViewRangePosition;
 - (NSUInteger)indexForRow:(NSUInteger)row inGroup:(NSString *)group;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-#pragma mark Mapping: View -> UI
+#pragma mark Mapping: YapDatabaseView -> UI
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 /**
@@ -667,8 +714,8 @@ typedef struct YapDatabaseViewRangePosition YapDatabaseViewRangePosition;
  * Returns NO if the given index is NOT visible (or out-of-bounds).
  * Returns NO if the given group is NOT visible (or invalid).
 **/
-- (BOOL)getRow:(NSUInteger *)rowPtr
-       section:(NSUInteger *)sectionPtr
+- (BOOL)getRow:(nullable NSUInteger *)rowPtr
+       section:(nullable NSUInteger *)sectionPtr
       forIndex:(NSUInteger)index
        inGroup:(NSString *)group;
 
@@ -678,7 +725,7 @@ typedef struct YapDatabaseViewRangePosition YapDatabaseViewRangePosition;
  * Returns the indexPath with the proper section and row.
  * Returns nil if the given index & group is NOT visible (or out-of-bounds).
 **/
-- (NSIndexPath *)indexPathForIndex:(NSUInteger)index inGroup:(NSString *)group;
+- (nullable NSIndexPath *)indexPathForIndex:(NSUInteger)index inGroup:(NSString *)group;
 
 /**
  * Maps from an index & group (in the View) to the corresponding row (in the UI).
@@ -786,12 +833,12 @@ typedef struct YapDatabaseViewRangePosition YapDatabaseViewRangePosition;
  *
  *     for (YapDatabaseViewSectionChange *sectionChange in sectionChanges)
  *     {
- *         // ... (see https://github.com/yaptv/YapDatabase/wiki/Views )
+ *         // ... (see https://github.com/yapstudios/YapDatabase/wiki/Views )
  *     }
  *
  *     for (YapDatabaseViewRowChange *rowChange in rowChanges)
  *     {
- *         // ... (see https://github.com/yaptv/YapDatabase/wiki/Views )
+ *         // ... (see https://github.com/yapstudios/YapDatabase/wiki/Views )
  *     }
  *
  *     [self.tableView endUpdates];
@@ -820,6 +867,8 @@ typedef struct YapDatabaseViewRangePosition YapDatabaseViewRangePosition;
  *     }
  * }
 **/
-- (NSIndexPath *)nearestIndexPathForRow:(NSUInteger)row inGroup:(NSString *)group;
+- (nullable NSIndexPath *)nearestIndexPathForRow:(NSUInteger)row inGroup:(NSString *)group;
 
 @end
+
+NS_ASSUME_NONNULL_END

@@ -1,6 +1,10 @@
 YapDatabase
 ===========
 
+[![Build Status](https://travis-ci.org/yapstudios/YapDatabase.svg?branch=master)](https://travis-ci.org/yapstudios/YapDatabase)
+[![Pod Version](https://img.shields.io/cocoapods/v/YapDatabase.svg?style=flat)](https://cocoapods.org/pods/YapDatabase)
+[![Carthage compatible](https://img.shields.io/badge/Carthage-compatible-4BC51D.svg?style=flat)](https://github.com/Carthage/Carthage)
+
 YapDatabase is a "**key/value store and MUCH MORE**" built atop sqlite for iOS & Mac.
 It has the following features:
 
@@ -8,7 +12,7 @@ It has the following features:
 
 * **Built-In Caching**. A configurable object cache is built-in. Of course sqlite has caching too. But it's caching raw serialized bytes, and we're dealing with objects. So having a built-in cache means you can skip the deserialization process, and get your objects much faster.
 
-* **Collections**. Sometimes a single key isn't enough. Sometimes a collection & key is better. No worries. We've got a database for that.
+* **Collections**. Sometimes a single key isn't enough. Sometimes a collection & key is better. No worries. YapDatabase supports collections out of the box.
 
 * **Metadata**. Ever wanted to store extra data along with your object? Like maybe a timestamp of when it was downloaded. Or a fully separate but related object? You're in luck. Metadata support comes standard. Along with its own separate configurable cache too!
 
@@ -18,6 +22,10 @@ It has the following features:
 
 * **Full Text Search**. Built atop sqlite's FTS module (contributed by google), you can add extremely speedy searching to your app with minimal effort.
 
+* **Relationships**. You can setup relationships between objects and even configure cascading delete rules.
+
+* **Sync**. Support for syncing with Apple's CloudKit is available out of the box. There's even a fully functioning example project that demonstrates writing a syncing Todo app.
+
 * **Extensions**. More than just a key/value store, YapDatabase comes with an extensions architecture built-in. You can even create your own extensions.
  
 * **Performance**. Fetch thousands of objects on the main thread without dropping a frame.
@@ -26,5 +34,5 @@ It has the following features:
 
 <br/>
 
-**[See what the API looks like in "hello world" for YapDatabase](https://github.com/yaptv/YapDatabase/wiki/Hello-World)**<br/>
-**[Learn more by visiting the wiki](https://github.com/yaptv/YapDatabase/wiki)**<br/>
+**[See what the API looks like in "hello world" for YapDatabase](https://github.com/yapstudios/YapDatabase/wiki/Hello-World)**<br/>
+**[Learn more by visiting the wiki](https://github.com/yapstudios/YapDatabase/wiki)**<br/>

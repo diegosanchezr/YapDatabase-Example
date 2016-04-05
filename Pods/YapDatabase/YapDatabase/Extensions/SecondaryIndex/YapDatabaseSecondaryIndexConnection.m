@@ -1,9 +1,11 @@
 #import "YapDatabaseSecondaryIndexConnection.h"
 #import "YapDatabaseSecondaryIndexPrivate.h"
+#import "YapDatabaseStatement.h"
 
 #import "YapDatabasePrivate.h"
 #import "YapDatabaseExtensionPrivate.h"
 
+#import "YapDatabaseString.h"
 #import "YapDatabaseLogging.h"
 
 #if ! __has_feature(objc_arc)
@@ -15,10 +17,12 @@
  * See YapDatabaseLogging.h for more information.
  **/
 #if DEBUG
-static const int ydbLogLevel = YDB_LOG_LEVEL_WARN;
+  static const int ydbLogLevel = YDB_LOG_LEVEL_WARN;
 #else
-static const int ydbLogLevel = YDB_LOG_LEVEL_WARN;
+  static const int ydbLogLevel = YDB_LOG_LEVEL_WARN;
 #endif
+#pragma unused(ydbLogLevel)
+
 
 @implementation YapDatabaseSecondaryIndexConnection
 {
@@ -28,18 +32,20 @@ static const int ydbLogLevel = YDB_LOG_LEVEL_WARN;
 	sqlite3_stmt *removeAllStatement;
 }
 
-@synthesize secondaryIndex = secondaryIndex;
+@synthesize secondaryIndex = parent;
 
-- (id)initWithSecondaryIndex:(YapDatabaseSecondaryIndex *)inSecondaryIndex
-          databaseConnection:(YapDatabaseConnection *)inDatabaseConnection
+- (id)initWithParent:(YapDatabaseSecondaryIndex *)inParent
+  databaseConnection:(YapDatabaseConnection *)inDatabaseConnection
 {
 	if ((self = [super init]))
 	{
-		secondaryIndex = inSecondaryIndex;
+		parent = inParent;
 		databaseConnection = inDatabaseConnection;
 		
 		queryCacheLimit = 10;
-		queryCache = [[YapCache alloc] initWithKeyClass:[NSString class] countLimit:queryCacheLimit];
+		queryCache = [[YapCache alloc] initWithCountLimit:queryCacheLimit];
+		queryCache.allowedKeyClasses = [NSSet setWithObject:[NSString class]];
+		queryCache.allowedObjectClasses = [NSSet setWithObject:[YapDatabaseStatement class]];
 	}
 	return self;
 }
@@ -47,7 +53,11 @@ static const int ydbLogLevel = YDB_LOG_LEVEL_WARN;
 - (void)dealloc
 {
 	[queryCache removeAllObjects];
-	
+	[self _flushStatements];
+}
+
+- (void)_flushStatements
+{
 	sqlite_finalize_null(&insertStatement);
 	sqlite_finalize_null(&updateStatement);
 	sqlite_finalize_null(&removeStatement);
@@ -57,19 +67,16 @@ static const int ydbLogLevel = YDB_LOG_LEVEL_WARN;
 /**
  * Required override method from YapDatabaseExtensionConnection
 **/
-- (void)_flushMemoryWithLevel:(int)level
+- (void)_flushMemoryWithFlags:(YapDatabaseConnectionFlushMemoryFlags)flags
 {
-	if (level >= YapDatabaseConnectionFlushMemoryLevelMild)
+	if (flags & YapDatabaseConnectionFlushMemoryFlags_Caches)
 	{
 		[queryCache removeAllObjects];
 	}
 	
-	if (level >= YapDatabaseConnectionFlushMemoryLevelModerate)
+	if (flags & YapDatabaseConnectionFlushMemoryFlags_Statements)
 	{
-		sqlite_finalize_null(&insertStatement);
-		sqlite_finalize_null(&updateStatement);
-		sqlite_finalize_null(&removeStatement);
-		sqlite_finalize_null(&removeAllStatement);
+		[self _flushStatements];
 	}
 }
 
@@ -82,7 +89,7 @@ static const int ydbLogLevel = YDB_LOG_LEVEL_WARN;
 **/
 - (YapDatabaseExtension *)extension
 {
-	return secondaryIndex;
+	return parent;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -113,7 +120,11 @@ static const int ydbLogLevel = YDB_LOG_LEVEL_WARN;
 		if (queryCacheEnabled)
 		{
 			if (queryCache == nil)
-				queryCache = [[YapCache alloc] initWithKeyClass:[NSString class] countLimit:queryCacheLimit];
+			{
+				queryCache = [[YapCache alloc] initWithCountLimit:queryCacheLimit];
+				queryCache.allowedKeyClasses = [NSSet setWithObject:[NSString class]];
+				queryCache.allowedObjectClasses = [NSSet setWithObject:[YapDatabaseStatement class]];
+			}
 		}
 		else
 		{
@@ -168,9 +179,8 @@ static const int ydbLogLevel = YDB_LOG_LEVEL_WARN;
 - (id)newReadTransaction:(YapDatabaseReadTransaction *)databaseTransaction
 {
 	YapDatabaseSecondaryIndexTransaction *transaction =
-	    [[YapDatabaseSecondaryIndexTransaction alloc]
-	        initWithSecondaryIndexConnection:self
-	                     databaseTransaction:databaseTransaction];
+	    [[YapDatabaseSecondaryIndexTransaction alloc] initWithParentConnection:self
+	                                                       databaseTransaction:databaseTransaction];
 	
 	return transaction;
 }
@@ -181,13 +191,10 @@ static const int ydbLogLevel = YDB_LOG_LEVEL_WARN;
 - (id)newReadWriteTransaction:(YapDatabaseReadWriteTransaction *)databaseTransaction
 {
 	YapDatabaseSecondaryIndexTransaction *transaction =
-	    [[YapDatabaseSecondaryIndexTransaction alloc]
-	        initWithSecondaryIndexConnection:self
-	                     databaseTransaction:databaseTransaction];
+	    [[YapDatabaseSecondaryIndexTransaction alloc] initWithParentConnection:self
+	                                                       databaseTransaction:databaseTransaction];
 	
-	if (blockDict == nil)
-		blockDict = [NSMutableDictionary dictionaryWithSharedKeySet:secondaryIndex->columnNamesSharedKeySet];
-	
+	[self prepareForReadWriteTransaction];
 	return transaction;
 }
 
@@ -196,11 +203,33 @@ static const int ydbLogLevel = YDB_LOG_LEVEL_WARN;
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 /**
+ * Initializes any ivars that a read-write transaction may need.
+**/
+- (void)prepareForReadWriteTransaction
+{
+	if (blockDict == nil)
+		blockDict = [NSMutableDictionary dictionaryWithSharedKeySet:parent->columnNamesSharedKeySet];
+	
+	if (mutationStack == nil)
+		mutationStack = [[YapMutationStack_Bool alloc] init];
+}
+
+- (void)postCommitCleanup
+{
+	[mutationStack clear];
+}
+
+- (void)postRollbackCleanup
+{
+	[mutationStack clear];
+}
+
+/**
  * Required override method from YapDatabaseExtension
 **/
-- (void)getInternalChangeset:(NSMutableDictionary **)internalChangesetPtr
-           externalChangeset:(NSMutableDictionary **)externalChangesetPtr
-              hasDiskChanges:(BOOL *)hasDiskChangesPtr
+- (void)getInternalChangeset:(NSMutableDictionary __unused **)internalChangesetPtr
+           externalChangeset:(NSMutableDictionary __unused **)externalChangesetPtr
+              hasDiskChanges:(BOOL __unused *)hasDiskChangesPtr
 {
 	// Nothing to do for this particular extension.
 	//
@@ -211,7 +240,7 @@ static const int ydbLogLevel = YDB_LOG_LEVEL_WARN;
 /**
  * Required override method from YapDatabaseExtension
 **/
-- (void)processChangeset:(NSDictionary *)changeset
+- (void)processChangeset:(NSDictionary __unused *)changeset
 {
 	// Nothing to do for this particular extension.
 	//
@@ -223,21 +252,37 @@ static const int ydbLogLevel = YDB_LOG_LEVEL_WARN;
 #pragma mark Statements
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
+- (void)prepareStatement:(sqlite3_stmt **)statement withString:(NSString *)stmtString caller:(SEL)caller_cmd
+{
+	sqlite3 *db = databaseConnection->db;
+	YapDatabaseString stmt; MakeYapDatabaseString(&stmt, stmtString);
+	
+	int status = sqlite3_prepare_v2(db, stmt.str, stmt.length+1, statement, NULL);
+	if (status != SQLITE_OK)
+	{
+		YDBLogError(@"%@: Error creating prepared statement: %d %s",
+					NSStringFromSelector(caller_cmd), status, sqlite3_errmsg(db));
+	}
+	
+	FreeYapDatabaseString(&stmt);
+}
+
 - (sqlite3_stmt *)insertStatement
 {
-	if (insertStatement == NULL)
+	sqlite3_stmt **statement = &insertStatement;
+	if (*statement == NULL)
 	{
 		NSMutableString *string = [NSMutableString stringWithCapacity:100];
-		[string appendFormat:@"INSERT INTO \"%@\" (\"rowid\"", [secondaryIndex tableName]];
+		[string appendFormat:@"INSERT INTO \"%@\" (\"rowid\"", [parent tableName]];
 		
-		for (YapDatabaseSecondaryIndexColumn *column in secondaryIndex->setup)
+		for (YapDatabaseSecondaryIndexColumn *column in parent->setup)
 		{
 			[string appendFormat:@", \"%@\"", column.name];
 		}
 		
 		[string appendString:@") VALUES (?"];
 		
-		NSUInteger count = [secondaryIndex->setup count];
+		NSUInteger count = [parent->setup count];
 		NSUInteger i;
 		for (i = 0; i < count; i++)
 		{
@@ -246,85 +291,68 @@ static const int ydbLogLevel = YDB_LOG_LEVEL_WARN;
 		
 		[string appendString:@");"];
 		
-		sqlite3 *db = databaseConnection->db;
-		
-		int status = sqlite3_prepare_v2(db, [string UTF8String], -1, &insertStatement, NULL);
-		if (status != SQLITE_OK)
-		{
-			YDBLogError(@"%@: Error creating prepared statement: %d %s", THIS_METHOD, status, sqlite3_errmsg(db));
-		}
+		[self prepareStatement:statement withString:string caller:_cmd];
 	}
 	
-	return insertStatement;
+	return *statement;
 }
 
 - (sqlite3_stmt *)updateStatement
 {
-	if (updateStatement == NULL)
+	sqlite3_stmt **statement = &updateStatement;
+	if (*statement == NULL)
 	{
 		NSMutableString *string = [NSMutableString stringWithCapacity:100];
-		[string appendFormat:@"UPDATE \"%@\" SET ", [secondaryIndex tableName]];
+		[string appendFormat:@"INSERT OR REPLACE INTO \"%@\" (\"rowid\"", [parent tableName]];
 		
-		NSUInteger i = 0;
-		for (YapDatabaseSecondaryIndexColumn *column in secondaryIndex->setup)
+		for (YapDatabaseSecondaryIndexColumn *column in parent->setup)
 		{
-			if (i == 0)
-				[string appendFormat:@"\"%@\" = ?", column.name];
-			else
-				[string appendFormat:@", \"%@\" = ?", column.name];
-			
-			i++;
+			[string appendFormat:@", \"%@\"", column.name];
 		}
 		
-		[string appendString:@" WHERE rowid = ?;"];
+		[string appendString:@") VALUES (?"];
 		
-		sqlite3 *db = databaseConnection->db;
-		
-		int status = sqlite3_prepare_v2(db, [string UTF8String], -1, &updateStatement, NULL);
-		if (status != SQLITE_OK)
+		NSUInteger count = [parent->setup count];
+		NSUInteger i;
+		for (i = 0; i < count; i++)
 		{
-			YDBLogError(@"%@: Error creating prepared statement: %d %s", THIS_METHOD, status, sqlite3_errmsg(db));
+			[string appendString:@", ?"];
 		}
+		
+		[string appendString:@");"];
+		
+		[self prepareStatement:statement withString:string caller:_cmd];
 	}
 	
-	return updateStatement;
+	return *statement;
 }
 
 - (sqlite3_stmt *)removeStatement
 {
-	if (removeStatement == NULL)
+	sqlite3_stmt **statement = &removeStatement;
+	if (*statement == NULL)
 	{
-		NSString *string =
-		    [NSString stringWithFormat:@"DELETE FROM \"%@\" WHERE \"rowid\" = ?;", [secondaryIndex tableName]];
+		NSString *string = [NSString stringWithFormat:
+		  @"DELETE FROM \"%@\" WHERE \"rowid\" = ?;", [parent tableName]];
 		
-		sqlite3 *db = databaseConnection->db;
-		
-		int status = sqlite3_prepare_v2(db, [string UTF8String], -1, &removeStatement, NULL);
-		if (status != SQLITE_OK)
-		{
-			YDBLogError(@"%@: Error creating prepared statement: %d %s", THIS_METHOD, status, sqlite3_errmsg(db));
-		}
+		[self prepareStatement:statement withString:string caller:_cmd];
 	}
 	
-	return removeStatement;
+	return *statement;
 }
 
 - (sqlite3_stmt *)removeAllStatement
 {
-	if (removeAllStatement == NULL)
+	sqlite3_stmt **statement = &removeAllStatement;
+	if (*statement == NULL)
 	{
-		NSString *string = [NSString stringWithFormat:@"DELETE FROM \"%@\";", [secondaryIndex tableName]];
+		NSString *string = [NSString stringWithFormat:
+		  @"DELETE FROM \"%@\";", [parent tableName]];
 		
-		sqlite3 *db = databaseConnection->db;
-		
-		int status = sqlite3_prepare_v2(db, [string UTF8String], -1, &removeAllStatement, NULL);
-		if (status != SQLITE_OK)
-		{
-			YDBLogError(@"%@: Error creating prepared statement: %d %s", THIS_METHOD, status, sqlite3_errmsg(db));
-		}
+		[self prepareStatement:statement withString:string caller:_cmd];
 	}
 	
-	return removeAllStatement;
+	return *statement;
 }
 
 @end

@@ -1,20 +1,21 @@
 #import <Foundation/Foundation.h>
+#import "YapCollectionKey.h"
 
-typedef enum {
+NS_ASSUME_NONNULL_BEGIN
+
+typedef NS_ENUM(NSInteger, YapDatabaseViewChangeType) {
 	YapDatabaseViewChangeInsert = 1,
 	YapDatabaseViewChangeDelete = 2,
 	YapDatabaseViewChangeMove   = 3,
 	YapDatabaseViewChangeUpdate = 4,
-	
-} YapDatabaseViewChangeType;
+};
 
-typedef enum {
+typedef NS_OPTIONS(NSUInteger, YapDatabaseViewChangesBitMask) {
 	YapDatabaseViewChangedObject     = 1 << 0, // 0001
 	YapDatabaseViewChangedMetadata   = 1 << 1, // 0010
-	YapDatabaseViewChangedDependency = 1 << 2, // 0100
-	
-} YapDatabaseViewChangesBitMask;
-
+	YapDatabaseViewChangedDependency = 1 << 2, // 0100  (used by YapDatabaseViewMappings)
+	YapDatabaseViewChangedSnippets   = 1 << 3, // 1000  (used by YapDatabaseSearchResultsView)
+};
 
 /**
  * YapDatabaseViewChange is designed to help facilitate animations to tableViews and collectionsViews.
@@ -24,11 +25,11 @@ typedef enum {
  * which are designed to give you an overview of the various technologies available.
  * 
  * General information about setting up and using Views:
- * https://github.com/yaptv/YapDatabase/wiki/Views
+ * https://github.com/yapstudios/YapDatabase/wiki/Views
  * 
  * General information about technologies which integrate with Views:
- * https://github.com/yaptv/YapDatabase/wiki/LongLivedReadTransactions
- * https://github.com/yaptv/YapDatabase/wiki/YapDatabaseModifiedNotification
+ * https://github.com/yapstudios/YapDatabase/wiki/LongLivedReadTransactions
+ * https://github.com/yapstudios/YapDatabase/wiki/YapDatabaseModifiedNotification
 **/
 
 @interface YapDatabaseViewSectionChange : NSObject <NSCopying>
@@ -86,8 +87,8 @@ typedef enum {
  *
  * YapDatabaseViewChangedMetadata means the metadata was changed.
  * This might have happend implicitly if the user invoked setObject:forKey:inCollection: (implicitly setting
- * the meatadata to nil). Or explicitly if the user invoked setObject:forKey:inCollection:withMetadata: or
- * setMetadata:forKey:inCollection:.
+ * the metadata to nil). Or explicitly if the user invoked setObject:forKey:inCollection:withMetadata: or
+ * replaceMetadata:forKey:inCollection:.
  * 
  * YapDatabaseViewChangedDependency means the row was flagged due to a cell drawing dependency configuration.
  * See YapDatabaseViewMappings: setCellDrawingDependencyForNeighboringCellWithOffset:forGroup:
@@ -117,7 +118,7 @@ typedef enum {
  *
  * @see YapDatabaseViewChangesBitMask
 **/
-@property (nonatomic, readonly) int changes;
+@property (nonatomic, readonly) YapDatabaseViewChangesBitMask changes;
 
 /**
  * The indexPath & newIndexPath are available after
@@ -182,7 +183,7 @@ typedef enum {
  * Once you have the sectionChanges & rowChanges, you can animate your tableView very simply like so:
  * 
  * PS - For a FULL CODE EXAMPLE, see the wiki:
- * https://github.com/yaptv/YapDatabase/wiki/Views#wiki-animating_updates_in_tableviews_collectionviews
+ * https://github.com/yapstudios/YapDatabase/wiki/Views#wiki-animating_updates_in_tableviews_collectionviews
  *
  * if ([sectionChanges count] == 0 & [rowChanges count] == 0)
  * {
@@ -258,6 +259,8 @@ typedef enum {
  *
  * The "final" values represent the location of the changed item
  * at the END of the read-write transaction(s).
+ * 
+ * This information also available in another form via the indexPath & newIndexPath properties.
 **/
 
 @property (nonatomic, readonly) NSUInteger originalIndex;
@@ -269,4 +272,51 @@ typedef enum {
 @property (nonatomic, readonly) NSString *originalGroup;
 @property (nonatomic, readonly) NSString *finalGroup;
 
+/**
+ * Gives you the {collection,key} tuple that caused the row change.
+ * 
+ * Please note that this information is not always available.
+ * In particular, it may not be available if:
+ *
+ * - the rowChange was due solely to a dependency (YapDatabaseViewChangedDependency)
+ * - the rowChange was due solely to satisfy a range constraint (YapDatabaseViewRangeOptions)
+ * - the rowChange was due to the database being cleared (removeAllObjectsInAllCollections)
+ * 
+ * However, it will be available for the most important situation,
+ * which is when a particular item from the database has been removed. (YapDatabaseViewChangeDelete)
+ * 
+ * In other situations (YapDatabaseViewChangeInsert, YapDatabaseViewChangeUpdate, YapDatabaseViewChangeMove)
+ * you'd be able to fetch the corresponding information directly from the View. For example:
+ * 
+ * for (YapDatabaseViewRowChange *rowChange in rowChanges)
+ * {
+ *     switch (rowChange.type)
+ *     {
+ *         // ...
+ *         case YapDatabaseViewChangeInsert :
+ *         {
+ *             // What changed exactly ?
+ *             __block NSString *collection = nil;
+ *             __block NSString *key = nil;
+ *             [databaseConnection readWithBlock:^(YapDatabaseReadTransaction *transaction){
+ *                 [[transaction ext:@"view"] getKey:&key
+ *                                        collection:&collection
+ *                                       atIndexPath:rowChange.newIndexPath
+ *                                      withMappings:mappings];
+ *             // ...
+ *         }
+ *         // ....
+ *     }
+ * }
+ * 
+ * However, you'll notice that you wouldn't be able to fetch the collection/key for a deleted item,
+ * because the rowChange.indexPath is no longer valid for the current state of the database/view.
+ *
+ * And thus that information is available via this property, should you ever need it.
+**/
+
+@property (nonatomic, readonly) YapCollectionKey *collectionKey;
+
 @end
+
+NS_ASSUME_NONNULL_END

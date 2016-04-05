@@ -1,10 +1,12 @@
 #import "YapDatabaseViewMappingsPrivate.h"
 #import "YapDatabaseViewRangeOptionsPrivate.h"
 #import "YapDatabaseViewTransaction.h"
-
 #import "YapDatabasePrivate.h"
-
 #import "YapDatabaseLogging.h"
+
+#if TARGET_OS_IPHONE
+#import <UIKit/UIKit.h>
+#endif
 
 #if ! __has_feature(objc_arc)
 #warning This file must be compiled with ARC. Use -fobjc-arc flag (or convert project to ARC).
@@ -19,22 +21,28 @@
 #else
   static const int ydbLogLevel = YDB_LOG_LEVEL_WARN;
 #endif
+#pragma unused(ydbLogLevel)
 
 
 @implementation YapDatabaseViewMappings
 {
 	// Immutable init parameters
-	NSArray *allGroups;
 	NSString *registeredViewName;
-	
+    
+    NSArray *allGroups;
+    
+    BOOL viewGroupsAreDynamic;
+    YapDatabaseViewMappingGroupFilter groupFilterBlock;
+    YapDatabaseViewMappingGroupSort groupSortBlock;
+    
 	// Mappings and cached counts
 	NSMutableArray *visibleGroups;
 	NSMutableDictionary *counts;
 	BOOL isUsingConsolidatedGroup;
 	BOOL autoConsolidationDisabled;
-	
+    
 	// Configuration
-	NSMutableSet *dynamicSections;
+	NSMutableDictionary *dynamicSections;
 	NSMutableSet *reverse;
 	NSMutableDictionary *rangeOptions;
 	NSMutableDictionary *dependencies;
@@ -60,32 +68,61 @@
 {
 	if ((self = [super init]))
 	{
-		allGroups = [[NSArray alloc] initWithArray:inGroups copyItems:YES];
-		registeredViewName = [inRegisteredViewName copy];
-		
+        allGroups = [[NSArray alloc] initWithArray:inGroups copyItems:YES];
 		NSUInteger allGroupsCount = [allGroups count];
+        viewGroupsAreDynamic = NO;
 		
 		visibleGroups = [[NSMutableArray alloc] initWithCapacity:allGroupsCount];
+		reverse       =   [[NSMutableSet alloc] initWithCapacity:allGroupsCount];
 		
-		dynamicSections = [[NSMutableSet alloc] initWithCapacity:allGroupsCount];
-		reverse         = [[NSMutableSet alloc] initWithCapacity:allGroupsCount];
+		id sharedKeySet = [NSDictionary sharedKeySetForKeys:[allGroups arrayByAddingObject:[NSNull null]]];
+		counts          = [NSMutableDictionary dictionaryWithSharedKeySet:sharedKeySet];
+		dynamicSections = [NSMutableDictionary dictionaryWithSharedKeySet:sharedKeySet];
+		rangeOptions    = [NSMutableDictionary dictionaryWithSharedKeySet:sharedKeySet];
+		dependencies    = [NSMutableDictionary dictionaryWithSharedKeySet:sharedKeySet];
 		
-		id sharedKeySet = [NSDictionary sharedKeySetForKeys:allGroups];
-		
-		counts       = [NSMutableDictionary dictionaryWithSharedKeySet:sharedKeySet];
-		rangeOptions = [NSMutableDictionary dictionaryWithSharedKeySet:sharedKeySet];
-		dependencies = [NSMutableDictionary dictionaryWithSharedKeySet:sharedKeySet];
-		
-		snapshotOfLastUpdate = UINT64_MAX;
+        [self commonInit:inRegisteredViewName];
 	}
 	return self;
 }
 
-- (id)copyWithZone:(NSZone *)zone
+- (id)initWithGroupFilterBlock:(YapDatabaseViewMappingGroupFilter)inFilter
+                     sortBlock:(YapDatabaseViewMappingGroupSort)inSort
+                          view:(NSString *)inRegisteredViewName
+{
+	if ((self = [super init]))
+	{
+		groupFilterBlock = inFilter;
+		groupSortBlock = inSort;
+		viewGroupsAreDynamic = YES;
+		
+		// We don't know what our capacity is going to be yet.
+		visibleGroups = [NSMutableArray new];
+		dynamicSections = [NSMutableDictionary new];
+		reverse = [NSMutableSet new];
+		rangeOptions = [NSMutableDictionary new];
+		dependencies = [NSMutableDictionary new];
+        
+        [self commonInit:inRegisteredViewName];
+    }
+    return self;
+}
+
+- (void)commonInit:(NSString *)inRegisteredViewName
+{
+	registeredViewName = [inRegisteredViewName copy];
+	snapshotOfLastUpdate = UINT64_MAX;
+}
+
+- (id)copyWithZone:(NSZone __unused *)zone
 {
 	YapDatabaseViewMappings *copy = [[YapDatabaseViewMappings alloc] init];
 	copy->allGroups = allGroups;
 	copy->registeredViewName = registeredViewName;
+    
+    copy->viewGroupsAreDynamic = viewGroupsAreDynamic;
+    copy->groupFilterBlock = groupFilterBlock;
+    copy->groupSortBlock = groupSortBlock;
 	
 	copy->visibleGroups = [visibleGroups mutableCopy];
 	copy->counts = [counts mutableCopy];
@@ -105,38 +142,49 @@
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+#pragma mark Utilities
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+- (BOOL)isGroupNameValid:(NSString *)group
+{
+	if (viewGroupsAreDynamic)
+		return YES; // group list changes dynamically, so any group name could be valid
+	else
+		return [allGroups containsObject:group];
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 #pragma mark Configuration
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-- (void)setIsDynamicSectionForAllGroups:(BOOL)isDynamic
-{
-	if (isDynamic)
-		[dynamicSections addObjectsFromArray:allGroups];
-	else
-		[dynamicSections removeAllObjects];
-}
-
-- (BOOL)isDynamicSectionForAllGroups
-{
-	return ([dynamicSections count] == [allGroups count]);
-}
-
 - (void)setIsDynamicSection:(BOOL)isDynamic forGroup:(NSString *)group
 {
-	if (![allGroups containsObject:group]) {
+	if (![self isGroupNameValid:group]) {
 		YDBLogWarn(@"%@ - mappings doesn't contain group(%@), only: %@", THIS_METHOD, group, allGroups);
 		return;
 	}
 	
-	if (isDynamic)
-		[dynamicSections addObject:group];
-	else
-		[dynamicSections removeObject:group];
+	[dynamicSections setObject:@(isDynamic) forKey:group];
 }
 
 - (BOOL)isDynamicSectionForGroup:(NSString *)group
 {
-	return [dynamicSections containsObject:group];
+	NSNumber *isDynamic = [dynamicSections objectForKey:group];
+	if (isDynamic == nil)
+		isDynamic = [dynamicSections objectForKey:[NSNull null]];
+	
+	return [isDynamic boolValue];
+}
+
+- (void)setIsDynamicSectionForAllGroups:(BOOL)isDynamic
+{
+	[dynamicSections removeAllObjects];
+	[dynamicSections setObject:@(isDynamic) forKey:[NSNull null]];
+}
+
+- (BOOL)isDynamicSectionForAllGroups
+{
+	return [[dynamicSections objectForKey:[NSNull null]] boolValue];
 }
 
 - (void)setRangeOptions:(YapDatabaseViewRangeOptions *)rangeOpts forGroup:(NSString *)group
@@ -145,8 +193,8 @@
 		[self removeRangeOptionsForGroup:group];
 		return;
 	}
-	
-	if (![allGroups containsObject:group]) {
+
+    if (![self isGroupNameValid:group]){
 		YDBLogWarn(@"%@ - mappings doesn't contain group(%@), only: %@", THIS_METHOD, group, allGroups);
 		return;
 	}
@@ -196,7 +244,8 @@
 
 - (void)setCellDrawingDependencyOffsets:(NSSet *)offsets forGroup:(NSString *)group
 {
-	if (![allGroups containsObject:group]) {
+
+    if (![self isGroupNameValid:group]){
 		YDBLogWarn(@"%@ - mappings doesn't contain group(%@), only: %@", THIS_METHOD, group, allGroups);
 		return;
 	}
@@ -249,7 +298,7 @@
 
 - (void)setIsReversed:(BOOL)isReversed forGroup:(NSString *)group
 {
-	if (![allGroups containsObject:group]) {
+    if (![self isGroupNameValid:group]){
 		YDBLogWarn(@"%@ - mappings doesn't contain group(%@), only: %@", THIS_METHOD, group, allGroups);
 		return;
 	}
@@ -267,24 +316,9 @@
 
 - (void)setAutoConsolidateGroupsThreshold:(NSUInteger)threshold withName:(NSString *)inConsolidatedGroupName
 {
-	if ([allGroups containsObject:inConsolidatedGroupName])
-	{
-		YDBLogWarn(@"%@ - consolidatedGroupName cannot match existing groupName", THIS_METHOD);
-		
-		autoConsolidateGroupsThreshold = 0;
-		consolidatedGroupName = nil;
-	}
-	
-	if (inConsolidatedGroupName == nil || threshold == 0)
-	{
-		autoConsolidateGroupsThreshold = 0;
-		consolidatedGroupName = nil;
-	}
-	else
-	{
-		autoConsolidateGroupsThreshold = threshold;
-		consolidatedGroupName = [inConsolidatedGroupName copy];
-	}
+    autoConsolidateGroupsThreshold = threshold;
+    consolidatedGroupName = [inConsolidatedGroupName copy];
+    [self validateAutoConsolidation];
 }
 
 - (NSUInteger)autoConsolidateGroupsThreshold
@@ -303,6 +337,12 @@
 
 - (void)updateWithTransaction:(YapDatabaseReadTransaction *)transaction
 {
+	[self updateWithTransaction:transaction forceUpdateRangeOptions:YES];
+}
+
+- (void)updateWithTransaction:(YapDatabaseReadTransaction *)transaction
+      forceUpdateRangeOptions:(BOOL)forceUpdateRangeOptions
+{
 	if (![transaction->connection isInLongLivedReadTransaction])
 	{
 		NSString *reason = @"YapDatabaseViewMappings requires the connection to be in a longLivedReadTransaction.";
@@ -314,7 +354,7 @@
 			@" YapDatabaseModifiedNotifications. This ensures that the data-source for your UI remains in a steady"
 			@" state at all times, and that updates are properly handled using the appropriate update mechanisms"
 			@" (and properly animated if desired)."
-			@" For example code, please see the wiki: https://github.com/yaptv/YapDatabase/wiki/Views";
+			@" For example code, please see the wiki: https://github.com/yapstudios/YapDatabase/wiki/Views";
 			
 		NSString *suggestion =
 		    @"You must invoke [databaseConnection beginLongLivedReadTransaction] before you initialize the mappings";
@@ -343,9 +383,18 @@
 		@throw [NSException exceptionWithName:@"YapDatabaseException" reason:reason userInfo:userInfo];
 	}
 	
+	YapDatabaseViewTransaction *viewTransaction = [transaction ext:registeredViewName];
+	if (viewGroupsAreDynamic)
+	{
+		NSArray *newGroups = [self filterAndSortGroups:[viewTransaction allGroups] withTransaction:transaction];
+		if ([self shouldUpdateAllGroupsWithNewGroups:newGroups]) {
+			[self updateMappingsWithNewGroups:newGroups];
+		}
+	}
+    
 	for (NSString *group in allGroups)
 	{
-		NSUInteger count = [[transaction ext:registeredViewName] numberOfKeysInGroup:group];
+		NSUInteger count = [viewTransaction numberOfItemsInGroup:group];
 		
 		[counts setObject:@(count) forKey:group];
 	}
@@ -353,18 +402,76 @@
 	BOOL firstUpdate = (snapshotOfLastUpdate == UINT64_MAX);
 	snapshotOfLastUpdate = [transaction->connection snapshot];
 	
-	if (firstUpdate)
-		[self initializeRangeOptsLength];
-	
+	if (firstUpdate || forceUpdateRangeOptions) {
+		[self updateRangeOptionsLength];
+	}
+	else {
+		// This method is being called via getSectionChanges:rowChanges:forNotifications:withMappings:.
+		// That code path will manually update the rangeOptions during processing.
+	}
 	[self updateVisibility];
 }
 
+- (void)updateMappingsWithNewGroups:(NSArray *)newAllGroups
+{
+	allGroups = [newAllGroups copy];
+    [self validateAutoConsolidation];
+    id sharedKeySet = [NSDictionary sharedKeySetForKeys:allGroups];
+    counts = [NSMutableDictionary dictionaryWithSharedKeySet:sharedKeySet];
+}
+
+- (void)validateAutoConsolidation{
+    if ([allGroups containsObject:consolidatedGroupName]){
+        YDBLogWarn(@"%@ - consolidatedGroupName cannot match existing groupName", THIS_METHOD);
+        consolidatedGroupName = nil;
+        autoConsolidateGroupsThreshold = 0;
+    }
+    
+    if (consolidatedGroupName == nil || autoConsolidateGroupsThreshold == 0){
+        consolidatedGroupName = nil;
+        autoConsolidateGroupsThreshold = 0;
+    }
+}
+
+- (NSArray *)filterAndSortGroups:(NSArray *)groups withTransaction:(YapDatabaseReadTransaction *)transaction
+{
+	NSMutableArray *newAllGroups = [NSMutableArray arrayWithCapacity:[groups count]];
+	for (NSString *group in groups)
+	{
+		if (groupFilterBlock(group, transaction)) {
+			[newAllGroups addObject:group];
+		}
+	}
+	
+	[newAllGroups sortUsingComparator:^NSComparisonResult(NSString *group1, NSString *group2) {
+		
+		return groupSortBlock(group1, group2, transaction);
+	}];
+    
+    return [newAllGroups copy];
+}
+
+- (BOOL)shouldUpdateAllGroupsWithNewGroups:(NSArray *)newGroups
+{
+	return ![allGroups isEqualToArray:newGroups];
+}
+
 /**
- * This method is internal.
+ * For UNIT TESTING only.
  * It is only for use by the unit tests in TestViewChangeLogic.
 **/
-- (void)updateWithCounts:(NSDictionary *)newCounts
+- (void)updateWithCounts:(NSDictionary *)newCounts forceUpdateRangeOptions:(BOOL)forceUpdateRangeOptions
 {
+	if (viewGroupsAreDynamic)
+	{
+		// The groups passed in the dictionary represent the new allGroups.
+		// This simulates as if we ran the groupFilterBlock & groupSortBlock.
+		
+		NSArray *newGroups = [newCounts allKeys];
+		if ([self shouldUpdateAllGroupsWithNewGroups:newGroups]) {
+			[self updateMappingsWithNewGroups:newGroups];
+        }
+    }
 	for (NSString *group in allGroups)
 	{
 		NSUInteger count = [[newCounts objectForKey:group] unsignedIntegerValue];
@@ -375,13 +482,16 @@
 	BOOL firstUpdate = (snapshotOfLastUpdate == UINT64_MAX);
 	snapshotOfLastUpdate = 0;
 	
-	if (firstUpdate)
-		[self initializeRangeOptsLength];
-	
+	if (firstUpdate || forceUpdateRangeOptions) {
+		[self updateRangeOptionsLength];
+	}
+	else {
+		// Simulating code path: getSectionChanges:rowChanges:forNotifications:withMappings:.
+	}
 	[self updateVisibility];
 }
 
-- (void)initializeRangeOptsLength
+- (void)updateRangeOptionsLength
 {
 	NSAssert(snapshotOfLastUpdate != UINT64_MAX, @"The counts are needed to set rangeOpts.length");
 	
@@ -421,9 +531,11 @@
 - (void)updateRangeOptionsForGroup:(NSString *)group withNewLength:(NSUInteger)newLength newOffset:(NSUInteger)newOffset
 {
 	YapDatabaseViewRangeOptions *rangeOpts = [rangeOptions objectForKey:group];
-	rangeOpts = [rangeOpts copyWithNewLength:newLength newOffset:newOffset];
-	
-	[rangeOptions setObject:rangeOpts forKey:group];
+	if (rangeOpts)
+	{
+		rangeOpts = [rangeOpts copyWithNewLength:newLength newOffset:newOffset];
+		[rangeOptions setObject:rangeOpts forKey:group];
+	}
 }
 
 - (void)updateVisibility
@@ -441,7 +553,7 @@
 		else
 			count = [[counts objectForKey:group] unsignedIntegerValue];
 		
-		if (count > 0 || ![dynamicSections containsObject:group]) {
+		if (count > 0 || ![self isGroupDynamic:group]) {
 			[visibleGroups addObject:group];
 		}
 		
@@ -454,9 +566,23 @@
 		isUsingConsolidatedGroup = NO;
 }
 
+- (BOOL)isGroupDynamic:(NSString *)group
+{
+	NSNumber *isDynamic = [dynamicSections objectForKey:group];
+	if (isDynamic == nil)
+		isDynamic = [dynamicSections objectForKey:[NSNull null]];
+	
+	return [isDynamic boolValue];
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 #pragma mark Internal
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+- (void)setAutoConsolidatingDisabled:(BOOL)disabled
+{
+	autoConsolidationDisabled = disabled;
+}
 
 - (NSMutableDictionary *)counts
 {
@@ -473,9 +599,20 @@
 	return [self numberOfItemsInGroup:group];
 }
 
-- (NSDictionary *)rangeOptions
+- (BOOL)hasRangeOptions
 {
-	return [rangeOptions copy];
+	return ([rangeOptions count] > 0);
+}
+
+- (BOOL)hasRangeOptionsForGroup:(NSString *)group
+{
+	return ([rangeOptions objectForKey:group] != nil);
+}
+
+- (YapDatabaseViewRangeOptions *)_rangeOptionsForGroup:(NSString *)group
+{
+	// Do NOT reverse the range options before returning them
+	return [[rangeOptions objectForKey:group] copy];
 }
 
 - (NSDictionary *)dependencies
@@ -486,11 +623,6 @@
 - (NSSet *)reverse
 {
 	return [reverse copy];
-}
-
-- (void)setAutoConsolidatingDisabled:(BOOL)disabled
-{
-	autoConsolidationDisabled = disabled;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -528,8 +660,13 @@
  * Returns the number of items in the given group.
  *
  * This is the cached value from the last time one of the following methods was invoked:
- * - updateWithTransaction:
- * - changesForNotifications:withMappings:
+ * - updateWithTransaction: 
+ * which should be invoked when the mapping is first created and then will be invoked whenever
+ * - (void)getSectionChanges:(NSArray **)sectionChangesPtr
+ *                rowChanges:(NSArray **)rowChangesPtr
+ *          forNotifications:(NSArray *)notifications
+ *              withMappings:(YapDatabaseViewMappings *)mappings 
+ * is called on the associated registered YapDatabaseView.
 **/
 - (NSUInteger)numberOfItemsInGroup:(NSString *)group
 {
@@ -1124,6 +1261,8 @@
 	return NO;
 }
 
+//- (NSUInteger)groupOffsetForGroup:
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 #pragma mark Getters + RangeOptions
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1274,6 +1413,33 @@
 	return total;
 }
 
+/**
+ * When isUsingConsolidatedGroup, this method returns the offset of the given group
+ * within the flattened/consolidated group.
+**/
+- (NSUInteger)rowOffsetForGroup:(NSString *)searchGroup
+{
+	NSUInteger offset = 0;
+	
+	for (NSString *group in visibleGroups) // NOT [self visibleGroups]
+	{
+		if ([group isEqualToString:searchGroup])
+		{
+			return offset;
+		}
+		else
+		{
+			YapDatabaseViewRangeOptions *rangeOpts = [rangeOptions objectForKey:group];
+			if (rangeOpts)
+				offset += rangeOpts.length;
+			else
+				offset += [[counts objectForKey:group] unsignedIntegerValue];
+		}
+	}
+	
+	return 0;
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 #pragma mark Getters + Utilities
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1338,12 +1504,12 @@
  *
  *     for (YapDatabaseViewSectionChange *sectionChange in sectionChanges)
  *     {
- *         // ... (see https://github.com/yaptv/YapDatabase/wiki/Views )
+ *         // ... (see https://github.com/yapstudios/YapDatabase/wiki/Views )
  *     }
  *
  *     for (YapDatabaseViewRowChange *rowChange in rowChanges)
  *     {
- *         // ... (see https://github.com/yaptv/YapDatabase/wiki/Views )
+ *         // ... (see https://github.com/yapstudios/YapDatabase/wiki/Views )
  *     }
  *
  *     [self.tableView endUpdates];
@@ -1390,7 +1556,16 @@
 		groupIndex++;
 	}
 	
-	if (!foundGroup) return nil;
+	if (!foundGroup)
+	{
+		// The given group doesn't exist.
+		//
+		// Note: You should NOT be passing the consolidatedGroup to this method.
+		// You need to pass the proper database view group.
+		// If the mappings are consolidated, this method will automatically translate the result for you.
+		
+		return nil;
+	}
 	
 	BOOL isGroupVisible = NO;
 	NSUInteger visibleGroupIndex = 0;
@@ -1412,24 +1587,21 @@
 		NSUInteger rows = [self numberOfItemsInGroup:searchGroup];
 		if (rows > 0)
 		{
-			if (row < rows)
+			NSUInteger _row = (row < rows) ? row : rows-1;
+			NSUInteger _section = visibleGroupIndex;
+			
+			if (isUsingConsolidatedGroup)
 			{
-			  #if TARGET_OS_IPHONE
-				return [NSIndexPath indexPathForRow:row inSection:visibleGroupIndex];
-			  #else
-				NSUInteger indexes[] = {visibleGroupIndex, row};
-				return [NSIndexPath indexPathWithIndexes:indexes length:2];
-			  #endif
+				_row += [self rowOffsetForGroup:searchGroup];
+				_section = 0;
 			}
-			else
-			{
-			  #if TARGET_OS_IPHONE
-				return [NSIndexPath indexPathForRow:(rows-1) inSection:visibleGroupIndex];
-			  #else
-				NSUInteger indexes[] = {visibleGroupIndex, (rows-1)};
-				return [NSIndexPath indexPathWithIndexes:indexes length:2];
-			  #endif
-			}
+			
+		  #if TARGET_OS_IPHONE
+			return [NSIndexPath indexPathForRow:_row inSection:_section];
+		  #else
+			NSUInteger indexes[] = {_section, _row};
+			return [NSIndexPath indexPathWithIndexes:indexes length:2];
+		  #endif
 		}
 	}
 	
@@ -1449,10 +1621,19 @@
 			NSUInteger rows = [self numberOfItemsInGroup:nearbyGroup];
 			if (rows > 0)
 			{
+				NSUInteger _row = rows-1;
+				NSUInteger _section = section;
+				
+				if (isUsingConsolidatedGroup)
+				{
+					_row += [self rowOffsetForGroup:nearbyGroup];
+					_section = 0;
+				}
+				
 			  #if TARGET_OS_IPHONE
-				return [NSIndexPath indexPathForRow:(rows-1) inSection:section];
+				return [NSIndexPath indexPathForRow:_row inSection:_section];
 			  #else
-				NSUInteger indexes[] = {section, (rows-1)};
+				NSUInteger indexes[] = {_section, _row};
 				return [NSIndexPath indexPathWithIndexes:indexes length:2];
 			  #endif
 			}
@@ -1473,10 +1654,19 @@
 			NSUInteger rows = [self numberOfItemsInGroup:nearbyGroup];
 			if (rows > 0)
 			{
+				NSUInteger _row = 0;
+				NSUInteger _section = section;
+				
+				if (isUsingConsolidatedGroup)
+				{
+					_row += [self rowOffsetForGroup:nearbyGroup];
+					_section = 0;
+				}
+				
 			  #if TARGET_OS_IPHONE
-				return [NSIndexPath indexPathForRow:0 inSection:section];
+				return [NSIndexPath indexPathForRow:_row inSection:_section];
 			  #else
-				NSUInteger indexes[] = {section, 0};
+				NSUInteger indexes[] = {_section, _row};
 				return [NSIndexPath indexPathWithIndexes:indexes length:2];
 			  #endif
 			}

@@ -1,19 +1,25 @@
 #import "YapDatabaseConnection.h"
-#import "YapDatabaseConnectionState.h"
-#import "YapDatabasePrivate.h"
-#import "YapDatabaseExtensionPrivate.h"
 
-#import "YapCollectionKey.h"
 #import "YapCache.h"
-#import "YapTouch.h"
+#import "YapCollectionKey.h"
+#import "YapDatabaseConnectionState.h"
+#import "YapDatabaseExtensionPrivate.h"
+#import "YapDatabaseLogging.h"
+#import "YapDatabasePrivate.h"
+#import "YapDatabaseString.h"
 #import "YapNull.h"
 #import "YapSet.h"
-
-#import "YapDatabaseString.h"
-#import "YapDatabaseLogging.h"
+#import "YapTouch.h"
 
 #import <objc/runtime.h>
+#import <mach/mach_time.h>
 #import <libkern/OSAtomic.h>
+
+#if TARGET_OS_IPHONE
+#import <UIKit/UIKit.h>
+#endif
+
+#include "yap_vfs_shim.h"
 
 #if ! __has_feature(objc_arc)
 #warning This file must be compiled with ARC. Use -fobjc-arc flag (or convert project to ARC).
@@ -28,20 +34,88 @@
 #else
   static const int ydbLogLevel = YDB_LOG_LEVEL_WARN;
 #endif
+#pragma unused(ydbLogLevel)
 
-#define DEFAULT_OBJECT_CACHE_LIMIT   250
-#define DEFAULT_METADATA_CACHE_LIMIT 500
+static NSUInteger const UNLIMITED_CACHE_LIMIT = 0;
+static NSUInteger const MIN_KEY_CACHE_LIMIT   = 500;
 
+#if YapDatabaseEnforcePermittedTransactions
+
+typedef BOOL (*IMP_NSThread_isMainThread)(id, SEL);
+static IMP_NSThread_isMainThread ydb_NSThread_isMainThread;
+static Class ydb_NSThread_Class;
+
+NS_INLINE BOOL YDBIsMainThread()
+{
+	return ydb_NSThread_isMainThread(ydb_NSThread_Class, @selector(isMainThread));
+}
+
+#endif
+
+static void yapNotifyDidRead(yap_file *file)
+{
+	__unsafe_unretained YapDatabaseConnection *connection =
+	          (__bridge YapDatabaseConnection *)file->yap_database_connection;
+	
+	if (connection)
+	{
+		if (connection->needsMarkSqlLevelSharedReadLock)
+			[connection markSqlLevelSharedReadLockAcquired];
+	}
+	
+	file->xNotifyDidRead = NULL;
+}
+
+
+static int connectionBusyHandler(void *ptr, int count)
+{
+	__unsafe_unretained YapDatabaseConnection *connection = (__bridge YapDatabaseConnection *)ptr;
+	
+	// sleep 50 milliseconds
+	int millis = 50;
+	usleep(millis * 1000);
+	
+	// log every 250 milliseconds
+	if ((count >= 4) && (count % 4 == 0)) {
+   	YDBLogWarn(@"Delay obtaining SQLite lock on connection (%p): %d milliseconds."
+		           @" Is another process locking the database?", connection, (millis * (count+1)));
+	}
+	
+	return 1;
+}
 
 @implementation YapDatabaseConnection {
 @private
 	
+	uint64_t snapshot;
+	
+	id sharedKeySetForInternalChangeset;
+	id sharedKeySetForExternalChangeset;
+	
+	YapDatabaseReadTransaction *longLivedReadTransaction;
+	BOOL throwExceptionsForImplicitlyEndingLongLivedReadTransaction;
+	NSMutableArray *pendingChangesets;
+	NSMutableArray *processedChangesets;
+	BOOL isFastForwarding;
+	
+	NSDictionary *registeredExtensions;
+	BOOL registeredExtensionsChanged;
+	
+	NSDictionary *registeredMemoryTables;
+	BOOL registeredMemoryTablesChanged;
+	
+	NSMutableDictionary *extensions;
+	BOOL extensionsReady;
+	id sharedKeySetForExtensions;
+	
 	sqlite3_stmt *beginTransactionStatement;
+	sqlite3_stmt *beginImmediateTransactionStatement;
 	sqlite3_stmt *commitTransactionStatement;
 	sqlite3_stmt *rollbackTransactionStatement;
 	
 	sqlite3_stmt *yapGetDataForKeyStatement;   // Against "yap" database, for internal use
 	sqlite3_stmt *yapSetDataForKeyStatement;   // Against "yap" database, for internal use
+	sqlite3_stmt *yapRemoveForKeyStatement;    // Against "yap" database, for internal use
 	sqlite3_stmt *yapRemoveExtensionStatement; // Against "yap" database, for internal use
 	
 	sqlite3_stmt *getCollectionCountStatement;
@@ -50,19 +124,20 @@
 	sqlite3_stmt *getCountForRowidStatement;
 	sqlite3_stmt *getRowidForKeyStatement;
 	sqlite3_stmt *getKeyForRowidStatement;
-	sqlite3_stmt *getKeyDataForRowidStatement;
-	sqlite3_stmt *getKeyMetadataForRowidStatement;
 	sqlite3_stmt *getDataForRowidStatement;
+	sqlite3_stmt *getMetadataForRowidStatement;
 	sqlite3_stmt *getAllForRowidStatement;
 	sqlite3_stmt *getDataForKeyStatement;
 	sqlite3_stmt *getMetadataForKeyStatement;
 	sqlite3_stmt *getAllForKeyStatement;
 	sqlite3_stmt *insertForRowidStatement;
 	sqlite3_stmt *updateAllForRowidStatement;
+	sqlite3_stmt *updateObjectForRowidStatement;
 	sqlite3_stmt *updateMetadataForRowidStatement;
 	sqlite3_stmt *removeForRowidStatement;
 	sqlite3_stmt *removeCollectionStatement;
 	sqlite3_stmt *removeAllStatement;
+	
 	sqlite3_stmt *enumerateCollectionsStatement;
 	sqlite3_stmt *enumerateCollectionsForKeyStatement;
 	sqlite3_stmt *enumerateKeysInCollectionStatement;
@@ -93,6 +168,18 @@
 		
 		method_setImplementation(extMethod, extensionIMP);
 		loaded = YES;
+		
+	#if YapDatabaseEnforcePermittedTransactions
+		
+		// Optimized invocation of [NSThread isMainThread].
+		// Benchmarks seem to indicate:
+		// - ~30% performance improvement on the main thread
+		// - ~50% performance improvement on background thread(s)
+		
+		ydb_NSThread_isMainThread = (IMP_NSThread_isMainThread)[NSThread methodForSelector:@selector(isMainThread)];
+		ydb_NSThread_Class = [NSThread class];
+		
+	#endif
 	}
 }
 
@@ -121,23 +208,49 @@
 		
 		extensions = [[NSMutableDictionary alloc] init];
 		
-		YapDatabaseDefaults *defaults = [database defaults];
+		YapDatabaseOptions *options = database.options;
+		
+		enableMultiProcessSupport = options.enableMultiProcessSupport;
+		
+		YapDatabaseConnectionDefaults *defaults = [database connectionDefaults];
+		
+		objectCacheLimit = defaults.objectCacheLimit;
+		metadataCacheLimit = defaults.metadataCacheLimit;
 		
 		if (defaults.objectCacheEnabled)
 		{
-			objectCacheLimit = defaults.objectCacheLimit;
-			objectCache = [[YapCache alloc] initWithKeyClass:[YapCollectionKey class]];
-			objectCache.countLimit = objectCacheLimit;
+			[self initializeObjectCache];
 		}
 		if (defaults.metadataCacheEnabled)
 		{
-			metadataCacheLimit = defaults.metadataCacheLimit;
-			metadataCache = [[YapCache alloc] initWithKeyClass:[YapCollectionKey class]];
-			metadataCache.countLimit = metadataCacheLimit;
+			[self initializeMetadataCache];
 		}
 		
+		NSUInteger keyCacheLimit = [self calculateKeyCacheLimit];
+		
+		YapBidirectionalCacheCallBacks RowidCallBacks = kYapBidirectionalCacheDefaultCallBacks;
+		RowidCallBacks.shouldCopy = NO;
+		
+		YapBidirectionalCacheCallBacks YapCollectionKeyCallBacks = kYapBidirectionalCacheDefaultCallBacks;
+		YapCollectionKeyCallBacks.shouldCopy = NO;
+		YapCollectionKeyCallBacks.equal = YapCollectionKeyEqual;
+		YapCollectionKeyCallBacks.hash = YapCollectionKeyHash;
+		
+		keyCache = [[YapBidirectionalCache alloc] initWithCountLimit:keyCacheLimit
+		                                                keyCallbacks:&RowidCallBacks
+		                                             objectCallbacks:&YapCollectionKeyCallBacks];
+		keyCache.allowedKeyClasses = [NSSet setWithObject:[NSNumber class]];
+		keyCache.allowedObjectClasses = [NSSet setWithObject:[YapCollectionKey class]];
+		
+		objectPolicy = defaults.objectPolicy;
+		metadataPolicy = defaults.metadataPolicy;
+		
+		#if YapDatabaseEnforcePermittedTransactions
+		self.permittedTransactions = YDB_AnyTransaction;
+		#endif
+		
 		#if TARGET_OS_IPHONE
-		self.autoFlushMemoryLevel = defaults.autoFlushMemoryLevel;
+		self.autoFlushMemoryFlags = defaults.autoFlushMemoryFlags;
 		#endif
 		
 		lock = OS_SPINLOCK_INIT;
@@ -152,7 +265,8 @@
 			
 			int flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_NOMUTEX | SQLITE_OPEN_PRIVATECACHE;
 			
-			int status = sqlite3_open_v2([database.databasePath UTF8String], &db, flags, NULL);
+			int status = sqlite3_open_v2([database.databasePath UTF8String], &db, flags,
+			                             [database->yap_vfs_shim_name UTF8String]);
 			if (status != SQLITE_OK)
 			{
 				// Sometimes the open function returns a db to allow us to query it for the error message
@@ -165,6 +279,40 @@
 			}
 			else
 			{
+				// Set configurable pragmas
+				
+				YapDatabasePragmaSynchronous pragmaSynchronous = options.pragmaSynchronous;
+				
+				if (pragmaSynchronous == YapDatabasePragmaSynchronous_Off ||
+				    pragmaSynchronous == YapDatabasePragmaSynchronous_Normal)
+				{
+					char *pragma_stmt = NULL;
+					
+					if (pragmaSynchronous == YapDatabasePragmaSynchronous_Off)
+						pragma_stmt = "PRAGMA synchronous = OFF;";
+					else
+						pragma_stmt = "PRAGMA synchronous = NORMAL;";
+				
+					status = sqlite3_exec(db, pragma_stmt, NULL, NULL, NULL);
+					if (status != SQLITE_OK)
+					{
+						YDBLogError(@"Error setting PRAGMA synchronous: %d %s", status, sqlite3_errmsg(db));
+					}
+				}
+				
+				if (options.pragmaMMapSize > 0)
+				{
+					NSString *pragma_mmap_size =
+					  [NSString stringWithFormat:@"PRAGMA mmap_size = %ld;", (long)options.pragmaMMapSize];
+					
+					status = sqlite3_exec(db, [pragma_mmap_size UTF8String], NULL, NULL, NULL);
+					if (status != SQLITE_OK)
+					{
+						YDBLogError(@"Error setting PRAGMA mmap_size: %d %s", status, sqlite3_errmsg(db));
+						// This isn't critical, so we can continue.
+					}
+				}
+				
 				// Disable autocheckpointing.
 				//
 				// YapDatabase has its own optimized checkpointing algorithm built-in.
@@ -174,20 +322,33 @@
 				
 				sqlite3_wal_autocheckpoint(db, 0);
 				
-				// Edge case workaround.
+				// Install busy handler.
 				//
-				// If there's an active checkpoint operation,
-				// then the very first time we call sqlite3_prepare_v2 on this db,
-				// we sometimes get a SQLITE_BUSY error.
+				// When multi-process support is ENABLED:
 				//
-				// This only seems to happen once, and only during the very first use of the db instance.
-				// I'm still tyring to figure out exactly why this is.
-				// For now I'm setting a busy timeout as a temporary workaround.
+				//   This allows us to warn the developer (via log statements) when another process
+				//   may be holding the write lock for too long.
 				//
-				// Note: I've also tested setting a busy_handler which logs the number of times its called.
-				// And in all my testing, I've only seen the busy_handler called once per db.
-				
-				sqlite3_busy_timeout(db, 50); // milliseconds
+				// When multi-process support is DISABLED:
+				//
+				//   The busy handler acts as a potential edge case workaround.
+				//
+				//   If there's an active checkpoint operation,
+				//   then the very first time we call sqlite3_prepare_v2 on this db,
+				//   we sometimes get a SQLITE_BUSY error.
+				//
+				//   This only seems to happen once, and only during the very first use of the db instance.
+				//   I'm still tyring to figure out exactly why this is. (sqlite bug ?)
+				//   For now I'm setting a busy timeout as a temporary workaround.
+				//
+				//   Note: In all my testing, I've only seen the busy_handler called once per db.
+                
+				sqlite3_busy_handler(db, connectionBusyHandler, (__bridge void *)(self));
+                
+#ifdef SQLITE_HAS_CODEC
+				// Configure SQLCipher encryption (if needed)
+				[database configureEncryptionForDatabase:db];
+#endif
 			}
 		}
 		
@@ -210,10 +371,11 @@
 	// This method is invoked from our connectionQueue, within the snapshotQueue.
 	// Don't do anything expensive here that might tie up the snapshotQueue.
 	
-	snapshot = [database snapshot];
-	registeredExtensions = [database registeredExtensions];
-	registeredTables = [database registeredTables];
-	extensionsOrder = [database extensionsOrder];
+	snapshot               = [database snapshot];
+	registeredExtensions   = [database registeredExtensions];
+	registeredMemoryTables = [database registeredMemoryTables];
+	extensionsOrder        = [database extensionsOrder];
+	extensionDependencies  = [database extensionDependencies];
 	
 	extensionsReady = ([registeredExtensions count] == 0);
 }
@@ -240,44 +402,21 @@
 	
 	[extensions removeAllObjects];
 	
-	sqlite_finalize_null(&beginTransactionStatement);
-	sqlite_finalize_null(&commitTransactionStatement);
-	sqlite_finalize_null(&rollbackTransactionStatement);
-	
-	sqlite_finalize_null(&yapGetDataForKeyStatement);
-	sqlite_finalize_null(&yapSetDataForKeyStatement);
-	sqlite_finalize_null(&yapRemoveExtensionStatement);
-	
-	sqlite_finalize_null(&getCollectionCountStatement);
-	sqlite_finalize_null(&getKeyCountForCollectionStatement);
-	sqlite_finalize_null(&getKeyCountForAllStatement);
-	sqlite_finalize_null(&getCountForRowidStatement);
-	sqlite_finalize_null(&getRowidForKeyStatement);
-	sqlite_finalize_null(&getKeyForRowidStatement);
-	sqlite_finalize_null(&getKeyDataForRowidStatement);
-	sqlite_finalize_null(&getKeyMetadataForRowidStatement);
-	sqlite_finalize_null(&getDataForRowidStatement);
-	sqlite_finalize_null(&getAllForRowidStatement);
-	sqlite_finalize_null(&getDataForKeyStatement);
-	sqlite_finalize_null(&insertForRowidStatement);
-	sqlite_finalize_null(&updateAllForRowidStatement);
-	sqlite_finalize_null(&updateMetadataForRowidStatement);
-	sqlite_finalize_null(&removeForRowidStatement);
-	sqlite_finalize_null(&removeCollectionStatement);
-	sqlite_finalize_null(&removeAllStatement);
-	sqlite_finalize_null(&enumerateCollectionsStatement);
-	sqlite_finalize_null(&enumerateCollectionsForKeyStatement);
-	sqlite_finalize_null(&enumerateKeysInCollectionStatement);
-	sqlite_finalize_null(&enumerateKeysInAllCollectionsStatement);
-	sqlite_finalize_null(&enumerateKeysAndMetadataInCollectionStatement);
-	sqlite_finalize_null(&enumerateKeysAndMetadataInAllCollectionsStatement);
-	sqlite_finalize_null(&enumerateKeysAndObjectsInCollectionStatement);
-	sqlite_finalize_null(&enumerateKeysAndObjectsInAllCollectionsStatement);
-	sqlite_finalize_null(&enumerateRowsInCollectionStatement);
-	sqlite_finalize_null(&enumerateRowsInAllCollectionsStatement);
+	[self _flushStatements];
 	
 	if (db)
 	{
+		if (main_file)
+		{
+			main_file->yap_database_connection = NULL;
+			main_file->xNotifyDidRead = NULL;
+		}
+		if (wal_file)
+		{
+			wal_file->yap_database_connection = NULL;
+			wal_file->xNotifyDidRead = NULL;
+		}
+		
 		if (![database connectionPoolEnqueue:db])
 		{
 			int status = sqlite3_close(db);
@@ -302,64 +441,71 @@
 #pragma mark Memory
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-/**
- * Optional override hook.
- * Don't forget to invoke [super _flushMemoryWithLevel:level].
-**/
-- (void)_flushMemoryWithLevel:(int)level
+- (void)_flushStatements
 {
-	if (level >= YapDatabaseConnectionFlushMemoryLevelMild)
+	sqlite_finalize_null(&beginTransactionStatement);
+	sqlite_finalize_null(&commitTransactionStatement);
+	sqlite_finalize_null(&rollbackTransactionStatement);
+	
+	sqlite_finalize_null(&yapGetDataForKeyStatement);
+	sqlite_finalize_null(&yapSetDataForKeyStatement);
+	sqlite_finalize_null(&yapRemoveForKeyStatement);
+	sqlite_finalize_null(&yapRemoveExtensionStatement);
+	
+	sqlite_finalize_null(&getCollectionCountStatement);
+	sqlite_finalize_null(&getKeyCountForCollectionStatement);
+	sqlite_finalize_null(&getKeyCountForAllStatement);
+	sqlite_finalize_null(&getCountForRowidStatement);
+	sqlite_finalize_null(&getRowidForKeyStatement);
+	sqlite_finalize_null(&getKeyForRowidStatement);
+	sqlite_finalize_null(&getDataForRowidStatement);
+	sqlite_finalize_null(&getMetadataForRowidStatement);
+	sqlite_finalize_null(&getAllForRowidStatement);
+	sqlite_finalize_null(&getDataForKeyStatement);
+	sqlite_finalize_null(&getMetadataForKeyStatement);
+	sqlite_finalize_null(&getAllForKeyStatement);
+	sqlite_finalize_null(&insertForRowidStatement);
+	sqlite_finalize_null(&updateAllForRowidStatement);
+	sqlite_finalize_null(&updateObjectForRowidStatement);
+	sqlite_finalize_null(&updateMetadataForRowidStatement);
+	sqlite_finalize_null(&removeForRowidStatement);
+	sqlite_finalize_null(&removeCollectionStatement);
+	sqlite_finalize_null(&removeAllStatement);
+	
+	sqlite_finalize_null(&enumerateCollectionsStatement);
+	sqlite_finalize_null(&enumerateCollectionsForKeyStatement);
+	sqlite_finalize_null(&enumerateKeysInCollectionStatement);
+	sqlite_finalize_null(&enumerateKeysInAllCollectionsStatement);
+	sqlite_finalize_null(&enumerateKeysAndMetadataInCollectionStatement);
+	sqlite_finalize_null(&enumerateKeysAndMetadataInAllCollectionsStatement);
+	sqlite_finalize_null(&enumerateKeysAndObjectsInCollectionStatement);
+	sqlite_finalize_null(&enumerateKeysAndObjectsInAllCollectionsStatement);
+	sqlite_finalize_null(&enumerateRowsInCollectionStatement);
+	sqlite_finalize_null(&enumerateRowsInAllCollectionsStatement);
+}
+
+- (void)_flushMemoryWithFlags:(YapDatabaseConnectionFlushMemoryFlags)flags
+{
+	if (flags & YapDatabaseConnectionFlushMemoryFlags_Caches)
 	{
+		[keyCache removeAllObjects];
 		[objectCache removeAllObjects];
 		[metadataCache removeAllObjects];
 	}
 	
-	if (level >= YapDatabaseConnectionFlushMemoryLevelModerate)
+	if (flags & YapDatabaseConnectionFlushMemoryFlags_Statements)
 	{
-		sqlite_finalize_null(&yapRemoveExtensionStatement);
-		sqlite_finalize_null(&rollbackTransactionStatement);
-		
-		sqlite_finalize_null(&getCollectionCountStatement);
-		sqlite_finalize_null(&getKeyCountForCollectionStatement);
-		sqlite_finalize_null(&getKeyCountForAllStatement);
-		sqlite_finalize_null(&getCountForRowidStatement);
-		sqlite_finalize_null(&getKeyForRowidStatement);
-		sqlite_finalize_null(&getKeyDataForRowidStatement);
-		sqlite_finalize_null(&getKeyMetadataForRowidStatement);
-		sqlite_finalize_null(&getDataForRowidStatement);
-		sqlite_finalize_null(&getAllForRowidStatement);
-		sqlite_finalize_null(&updateMetadataForRowidStatement);
-		sqlite_finalize_null(&removeForRowidStatement);
-		sqlite_finalize_null(&removeCollectionStatement);
-		sqlite_finalize_null(&removeAllStatement);
-		sqlite_finalize_null(&enumerateCollectionsStatement);
-		sqlite_finalize_null(&enumerateCollectionsForKeyStatement);
-		sqlite_finalize_null(&enumerateKeysInCollectionStatement);
-		sqlite_finalize_null(&enumerateKeysInAllCollectionsStatement);
-		sqlite_finalize_null(&enumerateKeysAndMetadataInCollectionStatement);
-		sqlite_finalize_null(&enumerateKeysAndMetadataInAllCollectionsStatement);
-		sqlite_finalize_null(&enumerateKeysAndObjectsInCollectionStatement);
-		sqlite_finalize_null(&enumerateKeysAndObjectsInAllCollectionsStatement);
-		sqlite_finalize_null(&enumerateRowsInCollectionStatement);
-		sqlite_finalize_null(&enumerateRowsInAllCollectionsStatement);
+		[self _flushStatements];
 	}
 	
-	if (level >= YapDatabaseConnectionFlushMemoryLevelFull)
+	if (flags & YapDatabaseConnectionFlushMemoryFlags_Internal)
 	{
-		sqlite_finalize_null(&yapGetDataForKeyStatement);
-		sqlite_finalize_null(&yapSetDataForKeyStatement);
-		sqlite_finalize_null(&beginTransactionStatement);
-		sqlite_finalize_null(&commitTransactionStatement);
-		
-		sqlite_finalize_null(&getRowidForKeyStatement);
-		sqlite_finalize_null(&getDataForKeyStatement);
-		sqlite_finalize_null(&insertForRowidStatement);
-		sqlite_finalize_null(&updateAllForRowidStatement);
+		sqlite3_db_release_memory(db);
 	}
 	
-	[extensions enumerateKeysAndObjectsUsingBlock:^(id extNameObj, id extConnectionObj, BOOL *stop) {
+	[extensions enumerateKeysAndObjectsUsingBlock:^(id __unused extNameObj, id extConnectionObj, BOOL __unused *stop) {
 		
-		[(YapDatabaseExtensionConnection *)extConnectionObj _flushMemoryWithLevel:level];
+		[(YapDatabaseExtensionConnection *)extConnectionObj _flushMemoryWithFlags:flags];
 	}];
 }
 
@@ -381,23 +527,23 @@
  * YapDatabaseConnectionFlushMemoryLevelFull (3):
  *     Full flush of all caches and removes all pre-compiled sqlite statements.
 **/
-- (void)flushMemoryWithLevel:(int)level
+- (void)flushMemoryWithFlags:(YapDatabaseConnectionFlushMemoryFlags)flags
 {
 	dispatch_block_t block = ^{
 		
-		[self _flushMemoryWithLevel:level];
+		[self _flushMemoryWithFlags:flags];
 	};
 	
 	if (dispatch_get_specific(IsOnConnectionQueueKey))
 		block();
 	else
-		dispatch_sync(connectionQueue, block);
+		dispatch_async(connectionQueue, block);
 }
 
 #if TARGET_OS_IPHONE
-- (void)didReceiveMemoryWarning:(NSNotification *)notification
+- (void)didReceiveMemoryWarning:(NSNotification __unused *)notification
 {
-	[self flushMemoryWithLevel:[self autoFlushMemoryLevel]];
+	[self flushMemoryWithFlags:[self autoFlushMemoryFlags]];
 }
 #endif
 
@@ -408,10 +554,12 @@
 @synthesize database = database;
 @synthesize name = _name;
 
-//@synthesize connectionQueue = connectionQueue;
+#if YapDatabaseEnforcePermittedTransactions
+@synthesize permittedTransactions = _mustUseAtomicProperty_permittedTransactions;
+#endif
 
 #if TARGET_OS_IPHONE
-@synthesize autoFlushMemoryLevel;
+@synthesize autoFlushMemoryFlags;
 #endif
 
 - (BOOL)objectCacheEnabled
@@ -438,14 +586,15 @@
 		{
 			if (objectCache == nil)
 			{
-				objectCache = [[YapCache alloc] initWithKeyClass:[YapCollectionKey class]];
-				objectCache.countLimit = objectCacheLimit;
+				[self initializeObjectCache];
 			}
 		}
 		else // Disabled
 		{
 			objectCache = nil;
 		}
+		
+		keyCache.countLimit = [self calculateKeyCacheLimit];
 	};
 	
 	if (dispatch_get_specific(IsOnConnectionQueueKey))
@@ -480,11 +629,12 @@
 			
 			if (objectCache == nil)
 			{
-				return; // Limit changed, but objectCache is still disabled
+				// Limit changed, but objectCache is still disabled
 			}
 			else
 			{
 				objectCache.countLimit = objectCacheLimit;
+				keyCache.countLimit = [self calculateKeyCacheLimit];
 			}
 		}
 	};
@@ -519,14 +669,15 @@
 		{
 			if (metadataCache == nil)
 			{
-				metadataCache = [[YapCache alloc] initWithKeyClass:[YapCollectionKey class]];
-				metadataCache.countLimit = metadataCacheLimit;
+				[self initializeMetadataCache];
 			}
 		}
 		else // Disabled
 		{
 			metadataCache = nil;
 		}
+		
+		keyCache.countLimit = [self calculateKeyCacheLimit];
 	};
 	
 	if (dispatch_get_specific(IsOnConnectionQueueKey))
@@ -561,11 +712,12 @@
 			
 			if (metadataCache == nil)
 			{
-				return; // Limit changed but metadataCache still disabled
+				// Limit changed but metadataCache still disabled
 			}
 			else
 			{
 				metadataCache.countLimit = metadataCacheLimit;
+				keyCache.countLimit = [self calculateKeyCacheLimit];
 			}
 		}
 	};
@@ -578,7 +730,7 @@
 
 - (YapDatabasePolicy)objectPolicy
 {
-	__block YapDatabasePolicy policy = YapDatabasePolicyShare;
+	__block YapDatabasePolicy policy = YapDatabasePolicyContainment;
 	
 	dispatch_block_t block = ^{
 		policy = objectPolicy;
@@ -614,7 +766,7 @@
 
 - (YapDatabasePolicy)metadataPolicy
 {
-	__block YapDatabasePolicy policy = YapDatabasePolicyShare;
+	__block YapDatabasePolicy policy = YapDatabasePolicyContainment;
 	
 	dispatch_block_t block = ^{
 		policy = metadataPolicy;
@@ -665,607 +817,958 @@
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+#pragma mark Utilities
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+- (void)initializeObjectCache
+{
+	objectCache = [[YapCache alloc] initWithCountLimit:objectCacheLimit
+	                                      keyCallbacks:[YapCollectionKey keyCallbacks]];
+	
+	objectCache.allowedKeyClasses = [NSSet setWithObject:[YapCollectionKey class]];
+}
+
+- (void)initializeMetadataCache
+{
+	metadataCache = [[YapCache alloc] initWithCountLimit:metadataCacheLimit
+	                                        keyCallbacks:[YapCollectionKey keyCallbacks]];
+	
+	metadataCache.allowedKeyClasses = [NSSet setWithObject:[YapCollectionKey class]];
+}
+
+- (NSUInteger)calculateKeyCacheLimit
+{
+	NSUInteger keyCacheLimit = MIN_KEY_CACHE_LIMIT;
+	
+	if (keyCacheLimit != UNLIMITED_CACHE_LIMIT)
+	{
+		if (objectCache)
+		{
+			if (objectCacheLimit == UNLIMITED_CACHE_LIMIT)
+				keyCacheLimit = UNLIMITED_CACHE_LIMIT;
+			else
+				keyCacheLimit = MAX(keyCacheLimit, objectCacheLimit);
+		}
+	}
+	
+	if (keyCacheLimit != UNLIMITED_CACHE_LIMIT)
+	{
+		if (metadataCache)
+		{
+			if (metadataCacheLimit == UNLIMITED_CACHE_LIMIT)
+				keyCacheLimit = UNLIMITED_CACHE_LIMIT;
+			else
+				keyCacheLimit = MAX(keyCacheLimit, metadataCacheLimit);
+		}
+	}
+	
+	return keyCacheLimit;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 #pragma mark Statements
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 - (sqlite3_stmt *)beginTransactionStatement
 {
-	if (beginTransactionStatement == NULL)
+	sqlite3_stmt **statement = &beginTransactionStatement;
+	if (*statement == NULL)
 	{
-		char *stmt = "BEGIN TRANSACTION;";
+		const char *stmt = "BEGIN TRANSACTION;";
 		int stmtLen = (int)strlen(stmt);
 		
-		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, &beginTransactionStatement, NULL);
+		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, statement, NULL);
 		if (status != SQLITE_OK)
 		{
-			YDBLogError(@"Error creating '%@': %d %s", NSStringFromSelector(_cmd), status, sqlite3_errmsg(db));
+			YDBLogError(@"Error creating '%@': %d %s", THIS_METHOD, status, sqlite3_errmsg(db));
 		}
 	}
 	
-	return beginTransactionStatement;
+	return *statement;
+}
+
+- (sqlite3_stmt *)beginImmediateTransactionStatement
+{
+    sqlite3_stmt **statement = &beginImmediateTransactionStatement;
+    if (*statement == NULL)
+    {
+        const char *stmt = "BEGIN IMMEDIATE TRANSACTION;";
+        int stmtLen = (int)strlen(stmt);
+        
+        int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, statement, NULL);
+        if (status != SQLITE_OK)
+        {
+            YDBLogError(@"Error creating '%@': %d %s", THIS_METHOD, status, sqlite3_errmsg(db));
+        }
+    }
+    
+    return *statement;
 }
 
 - (sqlite3_stmt *)commitTransactionStatement
 {
-	if (commitTransactionStatement == NULL)
+	sqlite3_stmt **statement = &commitTransactionStatement;
+	if (*statement == NULL)
 	{
-		char *stmt = "COMMIT TRANSACTION;";
+		const char *stmt = "COMMIT TRANSACTION;";
 		int stmtLen = (int)strlen(stmt);
 		
-		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, &commitTransactionStatement, NULL);
+		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, statement, NULL);
 		if (status != SQLITE_OK)
 		{
-			YDBLogError(@"Error creating '%@': %d %s", NSStringFromSelector(_cmd), status, sqlite3_errmsg(db));
+			YDBLogError(@"Error creating '%@': %d %s", THIS_METHOD, status, sqlite3_errmsg(db));
 		}
 	}
 	
-	return commitTransactionStatement;
+	return *statement;
 }
 
 - (sqlite3_stmt *)rollbackTransactionStatement
 {
-	if (rollbackTransactionStatement == NULL)
+	sqlite3_stmt **statement = &rollbackTransactionStatement;
+	if (*statement == NULL)
 	{
-		char *stmt = "ROLLBACK TRANSACTION;";
+		const char *stmt = "ROLLBACK TRANSACTION;";
 		int stmtLen = (int)strlen(stmt);
 		
-		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, &rollbackTransactionStatement, NULL);
+		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, statement, NULL);
 		if (status != SQLITE_OK)
 		{
-			YDBLogError(@"Error creating '%@': %d %s", NSStringFromSelector(_cmd), status, sqlite3_errmsg(db));
+			YDBLogError(@"Error creating '%@': %d %s", THIS_METHOD, status, sqlite3_errmsg(db));
 		}
 	}
 	
-	return rollbackTransactionStatement;
+	return *statement;
 }
 
 - (sqlite3_stmt *)yapGetDataForKeyStatement
 {
-	if (yapGetDataForKeyStatement == NULL)
+	sqlite3_stmt **statement = &yapGetDataForKeyStatement;
+	if (*statement == NULL)
 	{
-		char *stmt = "SELECT \"data\" FROM \"yap2\" WHERE \"extension\" = ? AND \"key\" = ?;";
+		const char *stmt = "SELECT \"data\" FROM \"yap2\" WHERE \"extension\" = ? AND \"key\" = ?;";
 		int stmtLen = (int)strlen(stmt);
 		
-		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, &yapGetDataForKeyStatement, NULL);
+		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, statement, NULL);
 		if (status != SQLITE_OK)
 		{
-			YDBLogError(@"Error creating '%@': %d %s", NSStringFromSelector(_cmd), status, sqlite3_errmsg(db));
+			YDBLogError(@"Error creating '%@': %d %s", THIS_METHOD, status, sqlite3_errmsg(db));
 		}
 	}
 	
-	return yapGetDataForKeyStatement;
+	return *statement;
 }
 
 - (sqlite3_stmt *)yapSetDataForKeyStatement
 {
-	if (yapSetDataForKeyStatement == NULL)
+	sqlite3_stmt **statement = &yapSetDataForKeyStatement;
+	if (*statement == NULL)
 	{
-		char *stmt = "INSERT OR REPLACE INTO \"yap2\" (\"extension\", \"key\", \"data\") VALUES (?, ?, ?);";
+		const char *stmt = "INSERT OR REPLACE INTO \"yap2\" (\"extension\", \"key\", \"data\") VALUES (?, ?, ?);";
 		int stmtLen = (int)strlen(stmt);
 		
-		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, &yapSetDataForKeyStatement, NULL);
+		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, statement, NULL);
 		if (status != SQLITE_OK)
 		{
-			YDBLogError(@"Error creating '%@': %d %s", NSStringFromSelector(_cmd), status, sqlite3_errmsg(db));
+			YDBLogError(@"Error creating '%@': %d %s", THIS_METHOD, status, sqlite3_errmsg(db));
 		}
 	}
 	
-	return yapSetDataForKeyStatement;
+	return *statement;
+}
+
+- (sqlite3_stmt *)yapRemoveForKeyStatement
+{
+	sqlite3_stmt **statement = &yapRemoveForKeyStatement;
+	if (*statement == NULL)
+	{
+		const char *stmt = "DELETE FROM \"yap2\" WHERE \"extension\" = ? AND \"key\" = ?;";
+		int stmtLen = (int)strlen(stmt);
+		
+		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, statement, NULL);
+		if (status != SQLITE_OK)
+		{
+			YDBLogError(@"Error creating '%@': %d %s", THIS_METHOD, status, sqlite3_errmsg(db));
+		}
+	}
+	
+	return *statement;
 }
 
 - (sqlite3_stmt *)yapRemoveExtensionStatement
 {
-	if (yapRemoveExtensionStatement == NULL)
+	sqlite3_stmt **statement = &yapRemoveExtensionStatement;
+	if (*statement == NULL)
 	{
-		char *stmt = "DELETE FROM \"yap2\" WHERE \"extension\" = ?;";
+		const char *stmt = "DELETE FROM \"yap2\" WHERE \"extension\" = ?;";
 		int stmtLen = (int)strlen(stmt);
 		
-		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, &yapRemoveExtensionStatement, NULL);
+		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, statement, NULL);
 		if (status != SQLITE_OK)
 		{
-			YDBLogError(@"Error creating '%@': %d %s", NSStringFromSelector(_cmd), status, sqlite3_errmsg(db));
+			YDBLogError(@"Error creating '%@': %d %s", THIS_METHOD, status, sqlite3_errmsg(db));
 		}
 	}
 	
-	return yapRemoveExtensionStatement;
+	return *statement;
 }
 
 - (sqlite3_stmt *)getCollectionCountStatement
 {
-	if (getCollectionCountStatement == NULL)
+	sqlite3_stmt **statement = &getCollectionCountStatement;
+	if (*statement == NULL)
 	{
-		char *stmt = "SELECT COUNT(DISTINCT collection) AS NumberOfRows FROM \"database2\";";
+		const char *stmt = "SELECT COUNT(DISTINCT collection) AS NumberOfRows FROM \"database2\";";
 		int stmtLen = (int)strlen(stmt);
 		
-		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, &getCollectionCountStatement, NULL);
+		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, statement, NULL);
 		if (status != SQLITE_OK)
 		{
-			YDBLogError(@"Error creating '%@': %d %s", NSStringFromSelector(_cmd), status, sqlite3_errmsg(db));
+			YDBLogError(@"Error creating '%@': %d %s", THIS_METHOD, status, sqlite3_errmsg(db));
 		}
 	}
 	
-	return getCollectionCountStatement;
+	return *statement;
 }
 
 - (sqlite3_stmt *)getKeyCountForCollectionStatement
 {
-	if (getKeyCountForCollectionStatement == NULL)
+	sqlite3_stmt **statement = &getKeyCountForCollectionStatement;
+	if (*statement == NULL)
 	{
-		char *stmt = "SELECT COUNT(*) AS NumberOfRows FROM \"database2\" WHERE \"collection\" = ?;";
+		const char *stmt = "SELECT COUNT(*) AS NumberOfRows FROM \"database2\" WHERE \"collection\" = ?;";
 		int stmtLen = (int)strlen(stmt);
 		
-		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, &getKeyCountForCollectionStatement, NULL);
+		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, statement, NULL);
 		if (status != SQLITE_OK)
 		{
-			YDBLogError(@"Error creating '%@': %d %s", NSStringFromSelector(_cmd), status, sqlite3_errmsg(db));
+			YDBLogError(@"Error creating '%@': %d %s", THIS_METHOD, status, sqlite3_errmsg(db));
 		}
 	}
 	
-	return getKeyCountForCollectionStatement;
+	return *statement;
 }
 
 - (sqlite3_stmt *)getKeyCountForAllStatement
 {
-	if (getKeyCountForAllStatement == NULL)
+	sqlite3_stmt **statement = &getKeyCountForAllStatement;
+	if (*statement == NULL)
 	{
-		char *stmt = "SELECT COUNT(*) AS NumberOfRows FROM \"database2\";";
+		const char *stmt = "SELECT COUNT(*) AS NumberOfRows FROM \"database2\";";
 		int stmtLen = (int)strlen(stmt);
 		
-		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, &getKeyCountForAllStatement, NULL);
+		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, statement, NULL);
 		if (status != SQLITE_OK)
 		{
-			YDBLogError(@"Error creating '%@': %d %s", NSStringFromSelector(_cmd), status, sqlite3_errmsg(db));
+			YDBLogError(@"Error creating '%@': %d %s", THIS_METHOD, status, sqlite3_errmsg(db));
 		}
 	}
 	
-	return getKeyCountForAllStatement;
+	return *statement;
 }
 
 - (sqlite3_stmt *)getCountForRowidStatement
 {
-	if (getCountForRowidStatement == NULL)
+	sqlite3_stmt **statement = &getCountForRowidStatement;
+	if (*statement == NULL)
 	{
-		char *stmt = "SELECT COUNT(*) AS NumberOfRows FROM \"database2\" WHERE \"rowid\" = ?;";
+		const char *stmt = "SELECT COUNT(*) AS NumberOfRows FROM \"database2\" WHERE \"rowid\" = ?;";
 		int stmtLen = (int)strlen(stmt);
 		
-		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, &getCountForRowidStatement, NULL);
+		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, statement, NULL);
 		if (status != SQLITE_OK)
 		{
-			YDBLogError(@"Error creating '%@': %d %s", NSStringFromSelector(_cmd), status, sqlite3_errmsg(db));
+			YDBLogError(@"Error creating '%@': %d %s", THIS_METHOD, status, sqlite3_errmsg(db));
 		}
 	}
 	
-	return getCountForRowidStatement;
+	return *statement;
 }
 
 - (sqlite3_stmt *)getRowidForKeyStatement
 {
-	if (getRowidForKeyStatement == NULL)
+	sqlite3_stmt **statement = &getRowidForKeyStatement;
+	if (*statement == NULL)
 	{
-		char *stmt = "SELECT \"rowid\" FROM \"database2\" WHERE \"collection\" = ? AND \"key\" = ?;";
+		const char *stmt = "SELECT \"rowid\" FROM \"database2\" WHERE \"collection\" = ? AND \"key\" = ?;";
 		int stmtLen = (int)strlen(stmt);
 		
-		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, &getRowidForKeyStatement, NULL);
+		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, statement, NULL);
 		if (status != SQLITE_OK)
 		{
-			YDBLogError(@"Error creating '%@': %d %s", NSStringFromSelector(_cmd), status, sqlite3_errmsg(db));
+			YDBLogError(@"Error creating '%@': %d %s", THIS_METHOD, status, sqlite3_errmsg(db));
 		}
 	}
 	
-	return getRowidForKeyStatement;
+	return *statement;
 }
 
 - (sqlite3_stmt *)getKeyForRowidStatement
 {
-	if (getKeyForRowidStatement == NULL)
+	sqlite3_stmt **statement = &getKeyForRowidStatement;
+	if (*statement == NULL)
 	{
-		char *stmt = "SELECT \"collection\", \"key\" FROM \"database2\" WHERE \"rowid\" = ?;";
+		const char *stmt = "SELECT \"collection\", \"key\" FROM \"database2\" WHERE \"rowid\" = ?;";
 		int stmtLen = (int)strlen(stmt);
 		
-		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, &getKeyForRowidStatement, NULL);
+		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, statement, NULL);
 		if (status != SQLITE_OK)
 		{
-			YDBLogError(@"Error creating '%@': %d %s", NSStringFromSelector(_cmd), status, sqlite3_errmsg(db));
+			YDBLogError(@"Error creating '%@': %d %s", THIS_METHOD, status, sqlite3_errmsg(db));
 		}
 	}
 	
-	return getKeyForRowidStatement;
-}
-
-- (sqlite3_stmt *)getKeyDataForRowidStatement
-{
-	if (getKeyDataForRowidStatement == NULL)
-	{
-		char *stmt = "SELECT \"collection\", \"key\", \"data\" FROM \"database2\" WHERE \"rowid\" = ?;";
-		int stmtLen = (int)strlen(stmt);
-		
-		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, &getKeyDataForRowidStatement, NULL);
-		if (status != SQLITE_OK)
-		{
-			YDBLogError(@"Error creating '%@': %d %s", NSStringFromSelector(_cmd), status, sqlite3_errmsg(db));
-		}
-	}
-	
-	return getKeyDataForRowidStatement;
-}
-
-- (sqlite3_stmt *)getKeyMetadataForRowidStatement
-{
-	if (getKeyMetadataForRowidStatement == NULL)
-	{
-		char *stmt = "SELECT \"collection\", \"key\", \"metadata\" FROM \"database2\" WHERE \"rowid\" = ?;";
-		int stmtLen = (int)strlen(stmt);
-		
-		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, &getKeyMetadataForRowidStatement, NULL);
-		if (status != SQLITE_OK)
-		{
-			YDBLogError(@"Error creating '%@': %d %s", NSStringFromSelector(_cmd), status, sqlite3_errmsg(db));
-		}
-	}
-	
-	return getKeyMetadataForRowidStatement;
+	return *statement;
 }
 
 - (sqlite3_stmt *)getDataForRowidStatement
 {
-	if (getDataForRowidStatement == NULL)
+	sqlite3_stmt **statement = &getDataForRowidStatement;
+	if (*statement == NULL)
 	{
-		char *stmt = "SELECT \"data\" FROM \"database2\" WHERE \"rowid\" = ?;";
+		const char *stmt = "SELECT \"data\" FROM \"database2\" WHERE \"rowid\" = ?;";
 		int stmtLen = (int)strlen(stmt);
 		
-		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, &getDataForRowidStatement, NULL);
+		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, statement, NULL);
 		if (status != SQLITE_OK)
 		{
-			YDBLogError(@"Error creating '%@': %d %s", NSStringFromSelector(_cmd), status, sqlite3_errmsg(db));
+			YDBLogError(@"Error creating '%@': %d %s", THIS_METHOD, status, sqlite3_errmsg(db));
 		}
 	}
 	
-	return getDataForRowidStatement;
+	return *statement;
+}
+
+- (sqlite3_stmt *)getMetadataForRowidStatement
+{
+	sqlite3_stmt **statement = &getMetadataForRowidStatement;
+	if (*statement == NULL)
+	{
+		const char *stmt = "SELECT \"metadata\" FROM \"database2\" WHERE \"rowid\" = ?;";
+		int stmtLen = (int)strlen(stmt);
+		
+		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, statement, NULL);
+		if (status != SQLITE_OK)
+		{
+			YDBLogError(@"Error creating '%@': %d %s", THIS_METHOD, status, sqlite3_errmsg(db));
+		}
+	}
+	
+	return *statement;
 }
 
 - (sqlite3_stmt *)getAllForRowidStatement
 {
-	if (getAllForRowidStatement == NULL)
+	sqlite3_stmt **statement = &getAllForRowidStatement;
+	if (*statement == NULL)
 	{
-		char *stmt = "SELECT \"collection\", \"key\", \"data\", \"metadata\" FROM \"database2\" WHERE \"rowid\" = ?;";
+		const char *stmt = "SELECT \"data\", \"metadata\" FROM \"database2\" WHERE \"rowid\" = ?;";
 		int stmtLen = (int)strlen(stmt);
 		
-		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, &getAllForRowidStatement, NULL);
+		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, statement, NULL);
 		if (status != SQLITE_OK)
 		{
-			YDBLogError(@"Error creating '%@': %d %s", NSStringFromSelector(_cmd), status, sqlite3_errmsg(db));
+			YDBLogError(@"Error creating '%@': %d %s", THIS_METHOD, status, sqlite3_errmsg(db));
 		}
 	}
 	
-	return getAllForRowidStatement;
+	return *statement;
 }
 
 - (sqlite3_stmt *)getDataForKeyStatement
 {
-	if (getDataForKeyStatement == NULL)
+	sqlite3_stmt **statement = &getDataForKeyStatement;
+	if (*statement == NULL)
 	{
-		char *stmt = "SELECT \"data\" FROM \"database2\" WHERE \"collection\" = ? AND \"key\" = ?;";
+		const char *stmt = "SELECT \"rowid\", \"data\" FROM \"database2\" WHERE \"collection\" = ? AND \"key\" = ?;";
 		int stmtLen = (int)strlen(stmt);
 		
-		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, &getDataForKeyStatement, NULL);
+		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, statement, NULL);
 		if (status != SQLITE_OK)
 		{
-			YDBLogError(@"Error creating '%@': %d %s", NSStringFromSelector(_cmd), status, sqlite3_errmsg(db));
+			YDBLogError(@"Error creating '%@': %d %s", THIS_METHOD, status, sqlite3_errmsg(db));
 		}
 	}
 	
-	return getDataForKeyStatement;
+	return *statement;
 }
 
 - (sqlite3_stmt *)getMetadataForKeyStatement
 {
-	if (getMetadataForKeyStatement == NULL)
+	sqlite3_stmt **statement = &getMetadataForKeyStatement;
+	if (*statement == NULL)
 	{
-		char *stmt = "SELECT \"metadata\" FROM \"database2\" WHERE \"collection\" = ? AND \"key\" = ?;";
+		const char *stmt = "SELECT \"rowid\", \"metadata\" FROM \"database2\" WHERE \"collection\" = ? AND \"key\" = ?;";
 		int stmtLen = (int)strlen(stmt);
 		
-		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, &getMetadataForKeyStatement, NULL);
+		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, statement, NULL);
 		if (status != SQLITE_OK)
 		{
-			YDBLogError(@"Error creating '%@': %d %s", NSStringFromSelector(_cmd), status, sqlite3_errmsg(db));
+			YDBLogError(@"Error creating '%@': %d %s", THIS_METHOD, status, sqlite3_errmsg(db));
 		}
 	}
 	
-	return getMetadataForKeyStatement;
+	return *statement;
 }
 
 - (sqlite3_stmt *)getAllForKeyStatement
 {
-	if (getAllForKeyStatement == NULL)
+	sqlite3_stmt **statement = &getAllForKeyStatement;
+	if (*statement == NULL)
 	{
-		char *stmt = "SELECT \"data\", \"metadata\" FROM \"database2\" WHERE \"collection\" = ? AND \"key\" = ?;";
+		const char *stmt = "SELECT \"rowid\", \"data\", \"metadata\" FROM \"database2\""
+		                   " WHERE \"collection\" = ? AND \"key\" = ?;";
 		int stmtLen = (int)strlen(stmt);
 		
-		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, &getAllForKeyStatement, NULL);
+		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, statement, NULL);
 		if (status != SQLITE_OK)
 		{
-			YDBLogError(@"Error creating '%@': %d %s", NSStringFromSelector(_cmd), status, sqlite3_errmsg(db));
+			YDBLogError(@"Error creating '%@': %d %s", THIS_METHOD, status, sqlite3_errmsg(db));
 		}
 	}
 	
-	return getAllForKeyStatement;
+	return *statement;
 }
 
 - (sqlite3_stmt *)insertForRowidStatement
 {
-	if (insertForRowidStatement == NULL)
+	sqlite3_stmt **statement = &insertForRowidStatement;
+	if (*statement == NULL)
 	{
-		char *stmt = "INSERT INTO \"database2\""
-		             " (\"collection\", \"key\", \"data\", \"metadata\") VALUES (?, ?, ?, ?);";
+		const char *stmt = "INSERT INTO \"database2\""
+		                   " (\"collection\", \"key\", \"data\", \"metadata\") VALUES (?, ?, ?, ?);";
 		int stmtLen = (int)strlen(stmt);
 		
-		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, &insertForRowidStatement, NULL);
+		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, statement, NULL);
 		if (status != SQLITE_OK)
 		{
-			YDBLogError(@"Error creating '%@': %d %s", NSStringFromSelector(_cmd), status, sqlite3_errmsg(db));
+			YDBLogError(@"Error creating '%@': %d %s", THIS_METHOD, status, sqlite3_errmsg(db));
 		}
 	}
 	
-	return insertForRowidStatement;
+	return *statement;
 }
 
 - (sqlite3_stmt *)updateAllForRowidStatement
 {
-	if (updateAllForRowidStatement == NULL)
+	sqlite3_stmt **statement = &updateAllForRowidStatement;
+	if (*statement == NULL)
 	{
-		char *stmt = "UPDATE \"database2\" SET \"data\" = ?, \"metadata\" = ? WHERE \"rowid\" = ?;";
+		const char *stmt = "UPDATE \"database2\" SET \"data\" = ?, \"metadata\" = ? WHERE \"rowid\" = ?;";
 		int stmtLen = (int)strlen(stmt);
 		
-		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, &updateAllForRowidStatement, NULL);
+		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, statement, NULL);
 		if (status != SQLITE_OK)
 		{
-			YDBLogError(@"Error creating '%@': %d %s", NSStringFromSelector(_cmd), status, sqlite3_errmsg(db));
+			YDBLogError(@"Error creating '%@': %d %s", THIS_METHOD, status, sqlite3_errmsg(db));
 		}
 	}
 	
-	return updateAllForRowidStatement;
+	return *statement;
+}
+
+- (sqlite3_stmt *)updateObjectForRowidStatement
+{
+	sqlite3_stmt **statement = &updateObjectForRowidStatement;
+	if (*statement == NULL)
+	{
+		const char *stmt = "UPDATE \"database2\" SET \"data\" = ? WHERE \"rowid\" = ?;";
+		int stmtLen = (int)strlen(stmt);
+		
+		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, statement, NULL);
+		if (status != SQLITE_OK)
+		{
+			YDBLogError(@"Error creating '%@': %d %s", THIS_METHOD, status, sqlite3_errmsg(db));
+		}
+	}
+	
+	return *statement;
 }
 
 - (sqlite3_stmt *)updateMetadataForRowidStatement
 {
-	if (updateMetadataForRowidStatement == NULL)
+	sqlite3_stmt **statement = &updateMetadataForRowidStatement;
+	if (*statement == NULL)
 	{
-		char *stmt = "UPDATE \"database2\" SET \"metadata\" = ? WHERE \"rowid\" = ?;";
+		const char *stmt = "UPDATE \"database2\" SET \"metadata\" = ? WHERE \"rowid\" = ?;";
 		int stmtLen = (int)strlen(stmt);
 		
-		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, &updateMetadataForRowidStatement, NULL);
+		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, statement, NULL);
 		if (status != SQLITE_OK)
 		{
-			YDBLogError(@"Error creating '%@': %d %s", NSStringFromSelector(_cmd), status, sqlite3_errmsg(db));
+			YDBLogError(@"Error creating '%@': %d %s", THIS_METHOD, status, sqlite3_errmsg(db));
 		}
 	}
 	
-	return updateMetadataForRowidStatement;
+	return *statement;
 }
 
 - (sqlite3_stmt *)removeForRowidStatement
 {
-	if (removeForRowidStatement == NULL)
+	sqlite3_stmt **statement = &removeForRowidStatement;
+	if (*statement == NULL)
 	{
-		char *stmt = "DELETE FROM \"database2\" WHERE \"rowid\" = ?;";
+		const char *stmt = "DELETE FROM \"database2\" WHERE \"rowid\" = ?;";
 		int stmtLen = (int)strlen(stmt);
 		
-		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, &removeForRowidStatement, NULL);
+		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, statement, NULL);
 		if (status != SQLITE_OK)
 		{
-			YDBLogError(@"Error creating '%@': %d %s", NSStringFromSelector(_cmd), status, sqlite3_errmsg(db));
+			YDBLogError(@"Error creating '%@': %d %s", THIS_METHOD, status, sqlite3_errmsg(db));
 		}
 	}
 	
-	return removeForRowidStatement;
+	return *statement;
 }
 
 - (sqlite3_stmt *)removeCollectionStatement
 {
-	if (removeCollectionStatement == NULL)
+	sqlite3_stmt **statement = &removeCollectionStatement;
+	if (*statement == NULL)
 	{
-		char *stmt = "DELETE FROM \"database2\" WHERE \"collection\" = ?;";
+		const char *stmt = "DELETE FROM \"database2\" WHERE \"collection\" = ?;";
 		int stmtLen = (int)strlen(stmt);
 		
-		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, &removeCollectionStatement, NULL);
+		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, statement, NULL);
 		if (status != SQLITE_OK)
 		{
-			YDBLogError(@"Error creating '%@': %d %s", NSStringFromSelector(_cmd), status, sqlite3_errmsg(db));
+			YDBLogError(@"Error creating '%@': %d %s", THIS_METHOD, status, sqlite3_errmsg(db));
 		}
 	}
 	
-	return removeCollectionStatement;
+	return *statement;
 }
 
 - (sqlite3_stmt *)removeAllStatement
 {
-	if (removeAllStatement == NULL)
+	sqlite3_stmt **statement = &removeAllStatement;
+	if (*statement == NULL)
 	{
-		char *stmt = "DELETE FROM \"database2\";";
+		const char *stmt = "DELETE FROM \"database2\";";
 		int stmtLen = (int)strlen(stmt);
 		
-		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, &removeAllStatement, NULL);
+		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, statement, NULL);
 		if (status != SQLITE_OK)
 		{
-			YDBLogError(@"Error creating '%@': %d %s", NSStringFromSelector(_cmd), status, sqlite3_errmsg(db));
+			YDBLogError(@"Error creating '%@': %d %s", THIS_METHOD, status, sqlite3_errmsg(db));
 		}
 	}
 	
-	return removeAllStatement;
+	return *statement;
 }
 
-- (sqlite3_stmt *)enumerateCollectionsStatement
+- (sqlite3_stmt *)enumerateCollectionsStatement:(BOOL *)needsFinalizePtr
 {
-	if (enumerateCollectionsStatement == NULL)
-	{
-		char *stmt = "SELECT DISTINCT \"collection\" FROM \"database2\";";
+	sqlite3_stmt **statement = &enumerateCollectionsStatement;
+	
+	sqlite3_stmt* (^CreateStatement)() = ^{
+		
+		const char *stmt = "SELECT DISTINCT \"collection\" FROM \"database2\";";
 		int stmtLen = (int)strlen(stmt);
 		
-		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, &enumerateCollectionsStatement, NULL);
+		sqlite3_stmt *result = NULL;
+		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, &result, NULL);
 		if (status != SQLITE_OK)
 		{
-			YDBLogError(@"Error creating '%@': %d %s", NSStringFromSelector(_cmd), status, sqlite3_errmsg(db));
+			YDBLogError(@"Error creating '%@': %d %s", THIS_METHOD, status, sqlite3_errmsg(db));
 		}
+		
+		return result;
+	};
+	
+	BOOL needsFinalize = NO;
+	sqlite3_stmt *result = NULL;
+	
+	if (*statement == NULL)
+	{
+		result = *statement = CreateStatement();
+	}
+	else if (sqlite3_stmt_busy(*statement))
+	{
+		result = CreateStatement();
+		needsFinalize = YES;
+	}
+	else
+	{
+		result = *statement;
 	}
 	
-	return enumerateCollectionsStatement;
+	NSParameterAssert(needsFinalizePtr != NULL);
+	*needsFinalizePtr = needsFinalize;
+	return result;
 }
 
-- (sqlite3_stmt *)enumerateCollectionsForKeyStatement
+- (sqlite3_stmt *)enumerateCollectionsForKeyStatement:(BOOL *)needsFinalizePtr
 {
-	if (enumerateCollectionsForKeyStatement == NULL)
-	{
-		char *stmt = "SELECT \"collection\" FROM \"database2\" WHERE \"key\" = ?;";
+	sqlite3_stmt **statement = &enumerateCollectionsForKeyStatement;
+	
+	sqlite3_stmt* (^CreateStatement)() = ^{
+		
+		const char *stmt = "SELECT \"collection\" FROM \"database2\" WHERE \"key\" = ?;";
 		int stmtLen = (int)strlen(stmt);
 		
-		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, &enumerateCollectionsForKeyStatement, NULL);
+		sqlite3_stmt *result = NULL;
+		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, &result, NULL);
 		if (status != SQLITE_OK)
 		{
-			YDBLogError(@"Error creating '%@': %d %s", NSStringFromSelector(_cmd), status, sqlite3_errmsg(db));
+			YDBLogError(@"Error creating '%@': %d %s", THIS_METHOD, status, sqlite3_errmsg(db));
 		}
+		
+		return result;
+	};
+	
+	BOOL needsFinalize = NO;
+	sqlite3_stmt *result = NULL;
+	
+	if (*statement == NULL)
+	{
+		result = *statement = CreateStatement();
+	}
+	else if (sqlite3_stmt_busy(*statement))
+	{
+		result = CreateStatement();
+		needsFinalize = YES;
+	}
+	else
+	{
+		result = *statement;
 	}
 	
-	return enumerateCollectionsForKeyStatement;
+	NSParameterAssert(needsFinalizePtr != NULL);
+	*needsFinalizePtr = needsFinalize;
+	return result;
 }
 
-- (sqlite3_stmt *)enumerateKeysInCollectionStatement
+- (sqlite3_stmt *)enumerateKeysInCollectionStatement:(BOOL *)needsFinalizePtr
 {
-	if (enumerateKeysInCollectionStatement == NULL)
-	{
-		char *stmt = "SELECT \"rowid\", \"key\" FROM \"database2\" WHERE collection = ?;";
+	sqlite3_stmt **statement = &enumerateKeysInCollectionStatement;
+	
+	sqlite3_stmt* (^CreateStatement)() = ^{
+		
+		const char *stmt = "SELECT \"rowid\", \"key\" FROM \"database2\" WHERE \"collection\" = ?;";
 		int stmtLen = (int)strlen(stmt);
 		
-		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, &enumerateKeysInCollectionStatement, NULL);
+		sqlite3_stmt *result = NULL;
+		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, &result, NULL);
 		if (status != SQLITE_OK)
 		{
-			YDBLogError(@"Error creating '%@': %d %s", NSStringFromSelector(_cmd), status, sqlite3_errmsg(db));
+			YDBLogError(@"Error creating '%@': %d %s", THIS_METHOD, status, sqlite3_errmsg(db));
 		}
+		
+		return result;
+	};
+	
+	BOOL needsFinalize = NO;
+	sqlite3_stmt *result = NULL;
+	
+	if (*statement == NULL)
+	{
+		result = *statement = CreateStatement();
+	}
+	else if (sqlite3_stmt_busy(*statement))
+	{
+		result = CreateStatement();
+		needsFinalize = YES;
+	}
+	else
+	{
+		result = *statement;
 	}
 	
-	return enumerateKeysInCollectionStatement;
+	NSParameterAssert(needsFinalizePtr != NULL);
+	*needsFinalizePtr = needsFinalize;
+	return result;
 }
 
-- (sqlite3_stmt *)enumerateKeysInAllCollectionsStatement
+- (sqlite3_stmt *)enumerateKeysInAllCollectionsStatement:(BOOL *)needsFinalizePtr
 {
-	if (enumerateKeysInAllCollectionsStatement == NULL)
-	{
-		char *stmt = "SELECT \"rowid\", \"collection\", \"key\" FROM \"database2\";";
+	sqlite3_stmt **statement = &enumerateKeysInAllCollectionsStatement;
+	
+	sqlite3_stmt* (^CreateStatement)() = ^{
+		
+		const char *stmt = "SELECT \"rowid\", \"collection\", \"key\" FROM \"database2\";";
 		int stmtLen = (int)strlen(stmt);
 		
-		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, &enumerateKeysInAllCollectionsStatement, NULL);
+		sqlite3_stmt *result = NULL;
+		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, &result, NULL);
 		if (status != SQLITE_OK)
 		{
-			YDBLogError(@"Error creating '%@': %d %s", NSStringFromSelector(_cmd), status, sqlite3_errmsg(db));
+			YDBLogError(@"Error creating '%@': %d %s", THIS_METHOD, status, sqlite3_errmsg(db));
 		}
+		
+		return result;
+	};
+	
+	BOOL needsFinalize = NO;
+	sqlite3_stmt *result = NULL;
+	
+	if (*statement == NULL)
+	{
+		result = *statement = CreateStatement();
+	}
+	else if (sqlite3_stmt_busy(*statement))
+	{
+		result = CreateStatement();
+		needsFinalize = YES;
+	}
+	else
+	{
+		result = *statement;
 	}
 	
-	return enumerateKeysInAllCollectionsStatement;
+	NSParameterAssert(needsFinalizePtr != NULL);
+	*needsFinalizePtr = needsFinalize;
+	return result;
 }
 
-- (sqlite3_stmt *)enumerateKeysAndMetadataInCollectionStatement
+- (sqlite3_stmt *)enumerateKeysAndMetadataInCollectionStatement:(BOOL *)needsFinalizePtr
 {
-	if (enumerateKeysAndMetadataInCollectionStatement == NULL)
-	{
-		char *stmt = "SELECT \"rowid\", \"key\", \"metadata\" FROM \"database2\" WHERE collection = ?;";
+	sqlite3_stmt **statement = &enumerateKeysAndMetadataInCollectionStatement;
+	
+	sqlite3_stmt* (^CreateStatement)() = ^{
+		
+		const char *stmt = "SELECT \"rowid\", \"key\", \"metadata\" FROM \"database2\" WHERE collection = ?;";
 		int stmtLen = (int)strlen(stmt);
 		
-		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, &enumerateKeysAndMetadataInCollectionStatement, NULL);
+		sqlite3_stmt *result = NULL;
+		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, &result, NULL);
 		if (status != SQLITE_OK)
 		{
-			YDBLogError(@"Error creating '%@': %d %s", NSStringFromSelector(_cmd), status, sqlite3_errmsg(db));
+			YDBLogError(@"Error creating '%@': %d %s", THIS_METHOD, status, sqlite3_errmsg(db));
 		}
+		
+		return result;
+	};
+	
+	BOOL needsFinalize = NO;
+	sqlite3_stmt *result = NULL;
+	
+	if (*statement == NULL)
+	{
+		result = *statement = CreateStatement();
+	}
+	else if (sqlite3_stmt_busy(*statement))
+	{
+		result = CreateStatement();
+		needsFinalize = YES;
+	}
+	else
+	{
+		result = *statement;
 	}
 	
-	return enumerateKeysAndMetadataInCollectionStatement;
+	NSParameterAssert(needsFinalizePtr != NULL);
+	*needsFinalizePtr = needsFinalize;
+	return result;
 }
 
-- (sqlite3_stmt *)enumerateKeysAndMetadataInAllCollectionsStatement
+- (sqlite3_stmt *)enumerateKeysAndMetadataInAllCollectionsStatement:(BOOL *)needsFinalizePtr
 {
-	if (enumerateKeysAndMetadataInAllCollectionsStatement == NULL)
-	{
-		char *stmt = "SELECT \"rowid\", \"collection\", \"key\", \"metadata\""
-		             " FROM \"database2\" ORDER BY \"collection\" ASC;";
+	sqlite3_stmt **statement = &enumerateKeysAndMetadataInAllCollectionsStatement;
+	
+	sqlite3_stmt* (^CreateStatement)() = ^{
+		
+		const char *stmt = "SELECT \"rowid\", \"collection\", \"key\", \"metadata\""
+		                   " FROM \"database2\" ORDER BY \"collection\" ASC;";
 		int stmtLen = (int)strlen(stmt);
 		
-		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, &enumerateKeysAndMetadataInAllCollectionsStatement, NULL);
+		sqlite3_stmt *result = NULL;
+		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, &result, NULL);
 		if (status != SQLITE_OK)
 		{
-			YDBLogError(@"Error creating '%@': %d %s", NSStringFromSelector(_cmd), status, sqlite3_errmsg(db));
+			YDBLogError(@"Error creating '%@': %d %s", THIS_METHOD, status, sqlite3_errmsg(db));
 		}
+		
+		return result;
+	};
+	
+	BOOL needsFinalize = NO;
+	sqlite3_stmt *result = NULL;
+	
+	if (*statement == NULL)
+	{
+		result = *statement = CreateStatement();
+	}
+	else if (sqlite3_stmt_busy(*statement))
+	{
+		result = CreateStatement();
+		needsFinalize = YES;
+	}
+	else
+	{
+		result = *statement;
 	}
 	
-	return enumerateKeysAndMetadataInAllCollectionsStatement;
+	NSParameterAssert(needsFinalizePtr != NULL);
+	*needsFinalizePtr = needsFinalize;
+	return result;
 }
 
-- (sqlite3_stmt *)enumerateKeysAndObjectsInCollectionStatement
+- (sqlite3_stmt *)enumerateKeysAndObjectsInCollectionStatement:(BOOL *)needsFinalizePtr
 {
-	if (enumerateKeysAndObjectsInCollectionStatement == NULL)
-	{
-		char *stmt = "SELECT \"rowid\", \"key\", \"data\" FROM \"database2\" WHERE \"collection\" = ?;";
+	sqlite3_stmt **statement = &enumerateKeysAndObjectsInCollectionStatement;
+	
+	sqlite3_stmt* (^CreateStatement)() = ^{
+		
+		const char *stmt = "SELECT \"rowid\", \"key\", \"data\" FROM \"database2\" WHERE \"collection\" = ?;";
 		int stmtLen = (int)strlen(stmt);
 		
-		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, &enumerateKeysAndObjectsInCollectionStatement, NULL);
+		sqlite3_stmt *result = NULL;
+		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, &result, NULL);
 		if (status != SQLITE_OK)
 		{
-			YDBLogError(@"Error creating '%@': %d %s", NSStringFromSelector(_cmd), status, sqlite3_errmsg(db));
+			YDBLogError(@"Error creating '%@': %d %s", THIS_METHOD, status, sqlite3_errmsg(db));
 		}
+		
+		return result;
+	};
+	
+	BOOL needsFinalize = NO;
+	sqlite3_stmt *result = NULL;
+	
+	if (*statement == NULL)
+	{
+		result = *statement = CreateStatement();
+	}
+	else if (sqlite3_stmt_busy(*statement))
+	{
+		result = CreateStatement();
+		needsFinalize = YES;
+	}
+	else
+	{
+		result = *statement;
 	}
 	
-	return enumerateKeysAndObjectsInCollectionStatement;
+	NSParameterAssert(needsFinalizePtr != NULL);
+	*needsFinalizePtr = needsFinalize;
+	return result;
 }
 
-- (sqlite3_stmt *)enumerateKeysAndObjectsInAllCollectionsStatement
+- (sqlite3_stmt *)enumerateKeysAndObjectsInAllCollectionsStatement:(BOOL *)needsFinalizePtr
 {
-	if (enumerateKeysAndObjectsInAllCollectionsStatement == NULL)
-	{
-		char *stmt = "SELECT \"rowid\", \"collection\", \"key\", \"data\""
-		             " FROM \"database2\" ORDER BY \"collection\" ASC;";
+	sqlite3_stmt **statement = &enumerateKeysAndObjectsInAllCollectionsStatement;
+	
+	sqlite3_stmt* (^CreateStatement)() = ^{
+		
+		const char *stmt = "SELECT \"rowid\", \"collection\", \"key\", \"data\""
+		                   " FROM \"database2\" ORDER BY \"collection\" ASC;";
 		int stmtLen = (int)strlen(stmt);
 		
-		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, &enumerateKeysAndObjectsInAllCollectionsStatement, NULL);
+		sqlite3_stmt *result = NULL;
+		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, &result, NULL);
 		if (status != SQLITE_OK)
 		{
-			YDBLogError(@"Error creating '%@': %d %s", NSStringFromSelector(_cmd), status, sqlite3_errmsg(db));
+			YDBLogError(@"Error creating '%@': %d %s", THIS_METHOD, status, sqlite3_errmsg(db));
 		}
+		
+		return result;
+	};
+	
+	BOOL needsFinalize = NO;
+	sqlite3_stmt *result = NULL;
+	
+	if (*statement == NULL)
+	{
+		result = *statement = CreateStatement();
+	}
+	else if (sqlite3_stmt_busy(*statement))
+	{
+		result = CreateStatement();
+		needsFinalize = YES;
+	}
+	else
+	{
+		result = *statement;
 	}
 	
-	return enumerateKeysAndObjectsInAllCollectionsStatement;
+	NSParameterAssert(needsFinalizePtr != NULL);
+	*needsFinalizePtr = needsFinalize;
+	return result;
 }
 
-- (sqlite3_stmt *)enumerateRowsInCollectionStatement
+- (sqlite3_stmt *)enumerateRowsInCollectionStatement:(BOOL *)needsFinalizePtr
 {
-	if (enumerateRowsInCollectionStatement == NULL)
-	{
-		char *stmt = "SELECT \"rowid\", \"key\", \"data\", \"metadata\" FROM \"database2\" WHERE \"collection\" = ?;";
+	sqlite3_stmt **statement = &enumerateRowsInCollectionStatement;
+	
+	sqlite3_stmt* (^CreateStatement)() = ^{
+		
+		const char *stmt = "SELECT \"rowid\", \"key\", \"data\", \"metadata\""
+		                   " FROM \"database2\" WHERE \"collection\" = ?;";
 		int stmtLen = (int)strlen(stmt);
 		
-		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, &enumerateRowsInCollectionStatement, NULL);
+		sqlite3_stmt *result = NULL;
+		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, &result, NULL);
 		if (status != SQLITE_OK)
 		{
-			YDBLogError(@"Error creating '%@': %d %s", NSStringFromSelector(_cmd), status, sqlite3_errmsg(db));
+			YDBLogError(@"Error creating '%@': %d %s", THIS_METHOD, status, sqlite3_errmsg(db));
 		}
+		
+		return result;
+	};
+	
+	BOOL needsFinalize = NO;
+	sqlite3_stmt *result = NULL;
+	
+	if (*statement == NULL)
+	{
+		result = *statement = CreateStatement();
+	}
+	else if (sqlite3_stmt_busy(*statement))
+	{
+		result = CreateStatement();
+		needsFinalize = YES;
+	}
+	else
+	{
+		result = *statement;
 	}
 	
-	return enumerateRowsInCollectionStatement;
+	NSParameterAssert(needsFinalizePtr != NULL);
+	*needsFinalizePtr = needsFinalize;
+	return result;
 }
 
-- (sqlite3_stmt *)enumerateRowsInAllCollectionsStatement
+- (sqlite3_stmt *)enumerateRowsInAllCollectionsStatement:(BOOL *)needsFinalizePtr
 {
-	if (enumerateRowsInAllCollectionsStatement == NULL)
-	{
-		char *stmt =
-		    "SELECT \"rowid\", \"collection\", \"key\", \"data\", \"metadata\""
-		    " FROM \"database2\" ORDER BY \"collection\" ASC;";
+	sqlite3_stmt **statement = &enumerateRowsInAllCollectionsStatement;
+	
+	sqlite3_stmt* (^CreateStatement)() = ^{
+		
+		const char *stmt = "SELECT \"rowid\", \"collection\", \"key\", \"data\", \"metadata\""
+		                   " FROM \"database2\" ORDER BY \"collection\" ASC;";
 		int stmtLen = (int)strlen(stmt);
 		
-		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, &enumerateRowsInAllCollectionsStatement, NULL);
+		sqlite3_stmt *result = NULL;
+		int status = sqlite3_prepare_v2(db, stmt, stmtLen+1, &result, NULL);
 		if (status != SQLITE_OK)
 		{
-			YDBLogError(@"Error creating '%@': %d %s", NSStringFromSelector(_cmd), status, sqlite3_errmsg(db));
+			YDBLogError(@"Error creating '%@': %d %s", THIS_METHOD, status, sqlite3_errmsg(db));
 		}
+		
+		return result;
+	};
+	
+	BOOL needsFinalize = NO;
+	sqlite3_stmt *result = NULL;
+	
+	if (*statement == NULL)
+	{
+		result = *statement = CreateStatement();
+	}
+	else if (sqlite3_stmt_busy(*statement))
+	{
+		result = CreateStatement();
+		needsFinalize = YES;
+	}
+	else
+	{
+		result = *statement;
 	}
 	
-	return enumerateRowsInAllCollectionsStatement;
+	NSParameterAssert(needsFinalizePtr != NULL);
+	*needsFinalizePtr = needsFinalize;
+	return result;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1285,6 +1788,31 @@
 **/
 - (void)readWithBlock:(void (^)(YapDatabaseReadTransaction *))block
 {
+#if YapDatabaseEnforcePermittedTransactions
+	YapDatabasePermittedTransactions flags = self.permittedTransactions;
+	if ((flags & YDB_MainThreadOnly) && !YDBIsMainThread())
+	{
+		@throw [self nonMainThreadException];
+	}
+	if (!(flags & YDB_SyncReadTransaction))
+	{
+		@throw [self unpermittedTransactionException:YDB_SyncReadTransaction];
+	}
+#endif
+	
+#ifndef NS_BLOCK_ASSERTIONS
+	if (dispatch_get_specific(IsOnConnectionQueueKey))
+	{
+		// You are attempting to execute a transaction within a transaction.
+		// This will result in deadlock.
+		// 
+		// For more information, see the "Thread Safety" wiki page:
+		// https://github.com/yapstudios/YapDatabase/wiki/Thread-Safety#connections-queues--deadlock
+		
+		@throw [self deadlockDetectionException];
+	}
+#endif
+	
 	dispatch_sync(connectionQueue, ^{ @autoreleasepool {
 		
 		if (longLivedReadTransaction)
@@ -1312,6 +1840,32 @@
 **/
 - (void)readWriteWithBlock:(void (^)(YapDatabaseReadWriteTransaction *transaction))block
 {
+#if YapDatabaseEnforcePermittedTransactions
+	YapDatabasePermittedTransactions flags = self.permittedTransactions;
+	if ((flags & YDB_MainThreadOnly) && !YDBIsMainThread())
+	{
+		@throw [self nonMainThreadException];
+	}
+	if (!(flags & YDB_SyncReadWriteTransaction))
+	{
+		@throw [self unpermittedTransactionException:YDB_SyncReadWriteTransaction];
+	}
+#endif
+	
+#ifndef NS_BLOCK_ASSERTIONS
+	if (dispatch_get_specific(IsOnConnectionQueueKey) ||
+	    dispatch_get_specific(database->IsOnWriteQueueKey))
+	{
+		// You are attempting to execute a transaction within a transaction.
+		// This will result in deadlock.
+		//
+		// For more information, see the "Thread Safety" wiki page:
+		// https://github.com/yapstudios/YapDatabase/wiki/Thread-Safety#connections-queues--deadlock
+		
+		@throw [self deadlockDetectionException];
+	}
+#endif
+	
 	// Order matters.
 	// First go through the serial connection queue.
 	// Then go through serial write queue for the database.
@@ -1360,11 +1914,11 @@
 **/
 - (void)asyncReadWithBlock:(void (^)(YapDatabaseReadTransaction *transaction))block
 {
-	[self asyncReadWithBlock:block completionBlock:NULL completionQueue:NULL];
+	[self asyncReadWithBlock:block completionQueue:NULL completionBlock:NULL];
 }
 
 /**
- * Read-write access to the database.
+ * Read-only access to the database.
  *
  * The given block can run concurrently with sibling connections,
  * regardless of whether the sibling connections are executing read-only or read-write transactions.
@@ -1377,11 +1931,11 @@
 - (void)asyncReadWithBlock:(void (^)(YapDatabaseReadTransaction *transaction))block
            completionBlock:(dispatch_block_t)completionBlock
 {
-	[self asyncReadWithBlock:block completionBlock:completionBlock completionQueue:NULL];
+	[self asyncReadWithBlock:block completionQueue:NULL completionBlock:completionBlock];
 }
 
 /**
- * Read-write access to the database.
+ * Read-only access to the database.
  *
  * The given block can run concurrently with sibling connections,
  * regardless of whether the sibling connections are executing read-only or read-write transactions.
@@ -1393,9 +1947,21 @@
  * If NULL, dispatch_get_main_queue() is automatically used.
 **/
 - (void)asyncReadWithBlock:(void (^)(YapDatabaseReadTransaction *transaction))block
-           completionBlock:(dispatch_block_t)completionBlock
            completionQueue:(dispatch_queue_t)completionQueue
+           completionBlock:(dispatch_block_t)completionBlock
 {
+#if YapDatabaseEnforcePermittedTransactions
+	YapDatabasePermittedTransactions flags = self.permittedTransactions;
+	if ((flags & YDB_MainThreadOnly) && !YDBIsMainThread())
+	{
+		@throw [self nonMainThreadException];
+	}
+	if (!(flags & YDB_AsyncReadTransaction))
+	{
+		@throw [self unpermittedTransactionException:YDB_AsyncReadTransaction];
+	}
+#endif
+	
 	if (completionQueue == NULL && completionBlock != NULL)
 		completionQueue = dispatch_get_main_queue();
 	
@@ -1429,7 +1995,7 @@
 **/
 - (void)asyncReadWriteWithBlock:(void (^)(YapDatabaseReadWriteTransaction *transaction))block
 {
-	[self asyncReadWriteWithBlock:block completionBlock:NULL completionQueue:NULL];
+	[self asyncReadWriteWithBlock:block completionQueue:NULL completionBlock:NULL];
 }
 
 /**
@@ -1447,7 +2013,7 @@
 - (void)asyncReadWriteWithBlock:(void (^)(YapDatabaseReadWriteTransaction *transaction))block
                 completionBlock:(dispatch_block_t)completionBlock
 {
-	[self asyncReadWriteWithBlock:block completionBlock:completionBlock completionQueue:NULL];
+	[self asyncReadWriteWithBlock:block completionQueue:NULL completionBlock:completionBlock];
 }
 
 /**
@@ -1464,9 +2030,21 @@
  * If NULL, dispatch_get_main_queue() is automatically used.
 **/
 - (void)asyncReadWriteWithBlock:(void (^)(YapDatabaseReadWriteTransaction *transaction))block
-                completionBlock:(dispatch_block_t)completionBlock
                 completionQueue:(dispatch_queue_t)completionQueue
+                completionBlock:(dispatch_block_t)completionBlock
 {
+#if YapDatabaseEnforcePermittedTransactions
+	YapDatabasePermittedTransactions flags = self.permittedTransactions;
+	if ((flags & YDB_MainThreadOnly) && !YDBIsMainThread())
+	{
+		@throw [self nonMainThreadException];
+	}
+	if (!(flags & YDB_AsyncReadWriteTransaction))
+	{
+		@throw [self unpermittedTransactionException:YDB_AsyncReadWriteTransaction];
+	}
+#endif
+	
 	if (completionQueue == NULL && completionBlock != NULL)
 		completionQueue = dispatch_get_main_queue();
 	
@@ -1540,7 +2118,20 @@
 **/
 - (void)preReadTransaction:(YapDatabaseReadTransaction *)transaction
 {
-	// Pre-Read-Transaction: Step 1 of 3
+	// Pre-Read-Transaction: Step 1 of 6
+	//
+	// Prep work: sqlite VFS shim listeners for read notifications (if needed).
+	// Initialize the 'main_file', if we haven't already.
+	
+	if (main_file == NULL)
+	{
+		sqlite3_file_control(db, "main", SQLITE_FCNTL_FILE_POINTER, &main_file);
+		if (main_file) {
+			main_file->yap_database_connection = (__bridge void *)self;
+		}
+	}
+	
+	// Pre-Read-Transaction: Step 2 of 6
 	//
 	// Execute "BEGIN TRANSACTION" on database connection.
 	// This is actually a deferred transaction, meaning the sqlite connection won't actually
@@ -1551,10 +2142,14 @@
 	// hit our in-memory caches. Thus we avoid sqlite machinery when unneeded.
 	
 	[transaction beginTransaction];
-		
+	
+	__block uint64_t dbSnapshot = 0;
+	__block BOOL expectsChangesets = NO;
+	__block NSArray *changesets = nil;
+	
 	dispatch_sync(database->snapshotQueue, ^{ @autoreleasepool {
 		
-		// Pre-Read-Transaction: Step 2 of 3
+		// Pre-Read-Transaction: Step 3 of 6
 		//
 		// Update our connection state within the state table.
 		//
@@ -1581,9 +2176,9 @@
 			if (state->connection == self)
 			{
 				myState = state;
-				myState->yapLevelSharedReadLock = YES;
+				myState->activeReadTransaction = YES;
 			}
-			else if (state->yapLevelExclusiveWriteLock)
+			else if (state->activeWriteTransaction)
 			{
 				hasActiveWriteTransaction = YES;
 			}
@@ -1591,19 +2186,27 @@
 		
 		NSAssert(myState != nil, @"Missing state in database->connectionStates");
 		
-		// Pre-Read-Transaction: Step 3 of 3
+		// Pre-Read-Transaction: Step 4 of 5
 		//
-		// Update our in-memory data (caches, etc) if needed.
+		// Compare our snapshot with the database's snapshot.
 		
-		if (hasActiveWriteTransaction || longLivedReadTransaction)
+		if (hasActiveWriteTransaction || longLivedReadTransaction || wal_file == NULL || enableMultiProcessSupport)
 		{
+			// If there is a write transaction in progress,
+			// then it's not safe to proceed until we acquire a "sql-level" snapshot.
+			//
 			// If this is for a longLivedReadTransaction,
 			// then we need to immediately acquire a "sql-level" snapshot.
 			//
-			// Otherwise if there is a write transaction in progress,
-			// then it's not safe to proceed until we acquire a "sql-level" snapshot.
+			// If sqlite hasn't opened the wal_file yet,
+			// then we need to invoke the sql machinery so we can get access to it.
+			// We need the wal_file in order to properly receive notifications of
+			// when sqlite acquires an "sql-level" snapshot.
 			//
-			// During this process we need to ensure that our "yap-level" snapshot of the in-memory data (caches, etc)
+			// In case of multiple processes accessing the database,
+			// we can't know for sure so we must make this assumption.
+			//
+			// During this process we ensure that our "yap-level" snapshot of the in-memory data (caches, etc)
 			// is in sync with our "sql-level" snapshot of the database.
 			//
 			// We can check this by comparing the connection's snapshot ivar with
@@ -1612,27 +2215,25 @@
 			// If the two match then our snapshots are in sync.
 			// If they don't then we need to get caught up by processing changesets.
 			
-			uint64_t yapSnapshot = snapshot;
-			uint64_t sqlSnapshot = [self readSnapshotFromDatabase];
-			
-			if (yapSnapshot < sqlSnapshot)
+			dbSnapshot = [self readSnapshotFromDatabase];
+			if (wal_file == NULL)
 			{
-				// The transaction can see the sqlite commit from another transaction,
-				// and it hasn't processed the changeset(s) yet. We need to process them now.
-				
-				NSArray *changesets = [database pendingAndCommittedChangesSince:yapSnapshot until:sqlSnapshot];
-				
-				for (NSDictionary *changeset in changesets)
-				{
-					[self noteCommittedChanges:changeset];
+				wal_file = yap_vfs_last_opened_wal(database->yap_vfs_shim);
+				if (wal_file) {
+					wal_file->yap_database_connection = (__bridge void *)self;
 				}
-				
-				NSAssert(snapshot == sqlSnapshot,
-				         @"Invalid connection state in preReadTransaction: snapshot(%llu) != sqlSnapshot(%llu): %@",
-				         snapshot, sqlSnapshot, changesets);
 			}
 			
-			myState->lastKnownSnapshot = snapshot;
+			if (snapshot < dbSnapshot)
+			{
+				// The transaction can see the sqlite commit from another transaction,
+				// and it hasn't processed the changeset(s) yet.
+				// We need to fetch them now.
+				
+				expectsChangesets = YES;
+				changesets = [database pendingAndCommittedChangesetsSince:snapshot until:dbSnapshot];
+			}
+			
 			myState->longLivedReadTransaction = (longLivedReadTransaction != nil);
 			myState->sqlLevelSharedReadLock = YES;
 			needsMarkSqlLevelSharedReadLock = NO;
@@ -1649,30 +2250,69 @@
 			// able to process a changeset from a sibling connection.
 			// If this is the case then we need to get caught up by processing the changeset(s).
 			
-			uint64_t localSnapshot = snapshot;
-			uint64_t globalSnapshot = [database snapshot];
+			dbSnapshot = [database snapshot];
 			
-			if (localSnapshot < globalSnapshot)
+			if (snapshot < dbSnapshot)
 			{
-				// The transaction hasn't processed recent changeset(s) yet. We need to process them now.
+				// The transaction hasn't processed recent changeset(s) yet.
+				// We need to fetch them now.
 				
-				NSArray *changesets = [database pendingAndCommittedChangesSince:localSnapshot until:globalSnapshot];
-				
-				for (NSDictionary *changeset in changesets)
-				{
-					[self noteCommittedChanges:changeset];
-				}
-				
-				NSAssert(snapshot == globalSnapshot,
-				         @"Invalid connection state in preReadTransaction: snapshot(%llu) != globalSnapshot(%llu): %@",
-				         snapshot, globalSnapshot, changesets);
+				expectsChangesets = YES;
+				changesets = [database pendingAndCommittedChangesetsSince:snapshot until:dbSnapshot];
 			}
 			
-			myState->lastKnownSnapshot = snapshot;
 			myState->sqlLevelSharedReadLock = NO;
 			needsMarkSqlLevelSharedReadLock = YES;
 		}
+		
+		myState->lastTransactionSnapshot = dbSnapshot;
+		myState->lastTransactionTime = mach_absolute_time();
 	}});
+	
+	// Pre-Read-Transaction: Setp 5 of 6
+	//
+	// Update our in-memory data (caches, etc) if needed.
+	// Since this can be CPU intensive, we do this outside the snapshotQueue.
+	
+	if (expectsChangesets)
+	{
+		if (!changesets) // we could not retrieve changeset due to a change from another process.
+		{
+			NSUInteger flags = YapDatabaseConnectionFlushMemoryFlags_Caches |
+			                   YapDatabaseConnectionFlushMemoryFlags_Extension_State;
+			
+			[self _flushMemoryWithFlags:flags];
+			snapshot = dbSnapshot;
+		}
+		else
+		{
+			isFastForwarding = YES;
+			for (NSDictionary *changeset in changesets)
+			{
+				[self noteCommittedChangeset:changeset];
+			}
+			isFastForwarding = NO;
+			
+			// The noteCommittedChangeset method (invoked above) updates our 'snapshot' variable.
+			NSAssert(snapshot == dbSnapshot,
+			         @"Invalid connection state in preReadTransaction: snapshot(%llu) != dbSnapshot(%llu): %@",
+			         snapshot, dbSnapshot, changesets);
+		}
+	}
+	
+	// Pre-Read-Transaction: Step 6 of 6
+	//
+	// Prep work: sqlite VFS shim listeners for read notifications (if needed).
+	// Initialize the 'wal_file', if we haven't already.
+	
+	if (needsMarkSqlLevelSharedReadLock)
+	{
+		if (main_file)
+			main_file->xNotifyDidRead = yapNotifyDidRead;
+		
+		if (wal_file)
+			wal_file->xNotifyDidRead = yapNotifyDidRead;
+	}
 }
 
 /**
@@ -1682,7 +2322,7 @@
 **/
 - (void)postReadTransaction:(YapDatabaseReadTransaction *)transaction
 {
-	// Post-Read-Transaction: Step 1 of 4
+	// Post-Read-Transaction: Step 1 of 5
 	//
 	// 1. Execute "COMMIT TRANSACTION" on database connection.
 	// If we had acquired "sql-level" shared read lock, this will release associated resources.
@@ -1690,12 +2330,23 @@
 	
 	[transaction commitTransaction];
 	
+	// Post-Read-Transaction: Step 2 of 5
+	//
+	// Disable sqlite VFS shim listeners for read notifications (if needed).
+	
+	if (main_file)
+		main_file->xNotifyDidRead = NULL;
+	
+	if (wal_file)
+		wal_file->xNotifyDidRead = NULL;
+	
+	
 	__block uint64_t minSnapshot = 0;
 	__block YapDatabaseConnectionState *writeStateToSignal = nil;
 	
 	dispatch_sync(database->snapshotQueue, ^{ @autoreleasepool {
 		
-		// Post-Read-Transaction: Step 2 of 4
+		// Post-Read-Transaction: Step 3 of 5
 		//
 		// Update our connection state within the state table.
 		//
@@ -1725,25 +2376,26 @@
 		{
 			if (state->connection == self)
 			{
-				wasMaybeBlockingWriteTransaction = state->yapLevelSharedReadLock && !state->sqlLevelSharedReadLock;
-				state->yapLevelSharedReadLock = NO;
-				state->sqlLevelSharedReadLock = NO;
+				state->activeReadTransaction = NO;
 				state->longLivedReadTransaction = NO;
+				
+				wasMaybeBlockingWriteTransaction = !state->sqlLevelSharedReadLock;
+				state->sqlLevelSharedReadLock = NO;
 			}
-			else if (state->yapLevelSharedReadLock)
+			else if (state->activeReadTransaction)
 			{
 				// Active sibling connection: read-only
 				
-				minSnapshot = MIN(state->lastKnownSnapshot, minSnapshot);
+				minSnapshot = MIN(state->lastTransactionSnapshot, minSnapshot);
 				
 				if (!state->sqlLevelSharedReadLock)
 					countOtherMaybeBlockingWriteTransaction++;
 			}
-			else if (state->yapLevelExclusiveWriteLock)
+			else if (state->activeWriteTransaction)
 			{
 				// Active sibling connection: read-write
 				
-				minSnapshot = MIN(state->lastKnownSnapshot, minSnapshot);
+				minSnapshot = MIN(state->lastTransactionSnapshot, minSnapshot);
 				
 				if (state->waitingForWriteLock)
 					blockedWriteState = state;
@@ -1758,7 +2410,7 @@
 		YDBLogVerbose(@"YapDatabaseConnection(%p) completing read-only transaction.", self);
 	}});
 	
-	// Post-Read-Transaction: Step 3 of 4
+	// Post-Read-Transaction: Step 4 of 5
 	//
 	// Check to see if this connection has been holding back the checkpoint process.
 	// That is, was this connection the last active connection on an old snapshot?
@@ -1772,13 +2424,13 @@
 		
 		[database asyncCheckpoint:minSnapshot];
 		
-		[registeredTables enumerateKeysAndObjectsUsingBlock:^(id key, id obj, BOOL *stop) {
+		[registeredMemoryTables enumerateKeysAndObjectsUsingBlock:^(id __unused key, id obj, BOOL __unused *stop) {
 			
 			[(YapMemoryTable *)obj asyncCheckpoint:minSnapshot];
 		}];
 	}
 	
-	// Post-Read-Transaction: Step 4 of 4
+	// Post-Read-Transaction: Step 5 of 5
 	//
 	// If we discovered a blocked write transaction,
 	// and it was blocked waiting on us (because we had a "yap-level" snapshot without an "sql-level" snapshot),
@@ -1802,12 +2454,32 @@
 **/
 - (void)preReadWriteTransaction:(YapDatabaseReadWriteTransaction *)transaction
 {
-	// Pre-Write-Transaction: Step 1 of 5
+	// Pre-Write-Transaction: Step 1 of 7
+	//
+	// Add IsOnConnectionQueueKey flag to writeQueue.
+	// This allows various methods that depend on the flag to operate correctly.
+	
+	dispatch_queue_set_specific(database->writeQueue, IsOnConnectionQueueKey, IsOnConnectionQueueKey, NULL);
+	
+	// Pre-Write-Transaction: Step 2 of 7
+	//
+	// Prep work: sqlite VFS shim listeners for read notifications (if needed).
+	// Initialize the 'main_file', if we haven't already.
+	
+	if (main_file == NULL)
+	{
+		sqlite3_file_control(db, "main", SQLITE_FCNTL_FILE_POINTER, &main_file);
+		if (main_file) {
+			main_file->yap_database_connection = (__bridge void *)self;
+		}
+	}
+	
+	// Pre-Write-Transaction: Step 3 of 7
 	//
 	// Execute "BEGIN TRANSACTION" on database connection.
 	// This is actually a deferred transaction, meaning the sqlite connection won't actually
 	// acquire any locks until it executes something.
-	// There are various alternatives to this, including a "immediate" and "exclusive" transactions.
+	// There are various alternatives to this, including "immediate" and "exclusive" transactions.
 	// However, these don't do what we want. Instead they block other read-only transactions.
 	// The deferred transaction allows other read-only transactions and even avoids
 	// sqlite operations if no modifications are made.
@@ -1817,11 +2489,20 @@
 	// Thus no other transactions can possibly modify the database during our transaction.
 	// Therefore it doesn't matter when we acquire our "sql-level" locks for writing.
 	
-	[transaction beginTransaction];
+	if (enableMultiProcessSupport) {
+		// In the multiprocess case, we don't use a deferred transaction in order to avoid race conditions
+		[transaction beginImmediateTransaction];
+	} else {
+		[transaction beginTransaction];
+	}
+	
+	__block uint64_t dbSnapshot = 0;
+	__block BOOL expectsChangesets = NO;
+	__block NSArray *changesets = nil;
 	
 	dispatch_sync(database->snapshotQueue, ^{ @autoreleasepool {
 		
-		// Pre-Write-Transaction: Step 2 of 5
+		// Pre-Write-Transaction: Step 4 of 7
 		//
 		// Update our connection state within the state table.
 		//
@@ -1835,40 +2516,97 @@
 			if (state->connection == self)
 			{
 				myState = state;
-				myState->yapLevelExclusiveWriteLock = YES;
+				myState->activeWriteTransaction = YES;
 			}
 		}
 		
 		NSAssert(myState != nil, @"Missing state in database->connectionStates");
 		
-		// Pre-Write-Transaction: Step 3 of 5
+		// Pre-Write-Transaction: Step 5 of 7
 		//
-		// Validate our caches based on snapshot numbers
+		// Compare our snapshot with the database's snapshot.
 		
-		uint64_t localSnapshot = snapshot;
-		uint64_t globalSnapshot = [database snapshot];
-		
-		if (localSnapshot < globalSnapshot)
+		// In multiprocess mode, the snapshot number might have been externally updated
+		if (wal_file == NULL || enableMultiProcessSupport)
 		{
-			NSArray *changesets = [database pendingAndCommittedChangesSince:localSnapshot until:globalSnapshot];
+			// If sqlite hasn't opened the wal_file yet,
+			// then we need to invoke the sql machinery so we can get access to it.
+			// We need the wal_file in order to properly receive notifications of
+			// when sqlite acquires an "sql-level" snapshot.
+			//
+			// In case of multiple processes accessing the database,
+			// we can't know for sure so we must make this assumption.
 			
-			for (NSDictionary *changeset in changesets)
+			dbSnapshot = [self readSnapshotFromDatabase];
+			if (wal_file == NULL)
 			{
-				[self noteCommittedChanges:changeset];
+				wal_file = yap_vfs_last_opened_wal(database->yap_vfs_shim);
+				if (wal_file) {
+					wal_file->yap_database_connection = (__bridge void *)self;
+				}
 			}
+		}
+		else
+		{
+			// We can just grab the snapshot from YapDatabase's in-memory version.
 			
-			NSAssert(snapshot == globalSnapshot,
-			         @"Invalid connection state in preReadWriteTransaction: snapshot(%llu) != globalSnapshot(%llu)",
-			         snapshot, globalSnapshot);
+			dbSnapshot = [database snapshot];
 		}
 		
-		myState->lastKnownSnapshot = snapshot;
+		if (snapshot < dbSnapshot)
+		{
+			// The transaction hasn't processed recent changeset(s) yet.
+			// We need to fetch them now.
+			
+			expectsChangesets = YES;
+			changesets = [database pendingAndCommittedChangesetsSince:snapshot until:dbSnapshot];
+		}
+		
+		myState->lastTransactionSnapshot = dbSnapshot;
+		myState->lastTransactionTime = mach_absolute_time();
 		needsMarkSqlLevelSharedReadLock = NO;
 		
 		YDBLogVerbose(@"YapDatabaseConnection(%p) starting read-write transaction.", self);
 	}});
 	
-	// Pre-Write-Transaction: Step 4 of 5
+	// Pre-Write-Transaction: Step 6 of 7
+	//
+	// Update our in-memory data (caches, etc) if needed.
+	// Since this can be CPU intensive, we do this outside the snapshotQueue.
+	
+	if (expectsChangesets)
+	{
+		externallyModified = (changesets == nil);
+		
+		if (!changesets) // we could not retrieve changeset due to a change from another process.
+		{
+			NSUInteger flags = YapDatabaseConnectionFlushMemoryFlags_Caches |
+			                   YapDatabaseConnectionFlushMemoryFlags_Extension_State;
+			
+			[self _flushMemoryWithFlags:flags];
+			snapshot = dbSnapshot;
+		}
+		else
+		{
+			isFastForwarding = YES;
+			for (NSDictionary *changeset in changesets)
+			{
+				[self noteCommittedChangeset:changeset];
+			}
+			isFastForwarding = NO;
+			
+			// The noteCommittedChangeset method (invoked above) updates our 'snapshot' variable.
+			NSAssert(snapshot == dbSnapshot,
+			         @"Invalid connection state in preReadWriteTransaction: snapshot(%llu) != dbSnapshot(%llu)",
+			         snapshot, dbSnapshot);
+		}
+	}
+	else
+	{
+		externallyModified = NO;
+	}
+	
+	// Pre-Write-Transaction: Step 7 of 7
 	//
 	// Setup write state and changeset variables
 	
@@ -1876,21 +2614,23 @@
 	
 	if (objectChanges == nil)
 		objectChanges = [[NSMutableDictionary alloc] init];
+	
 	if (metadataChanges == nil)
 		metadataChanges = [[NSMutableDictionary alloc] init];
+	
 	if (removedKeys == nil)
 		removedKeys = [[NSMutableSet alloc] init];
+	
 	if (removedCollections == nil)
 		removedCollections = [[NSMutableSet alloc] init];
 	
+	if (removedRowids == nil)
+		removedRowids = [[NSMutableSet alloc] init];
+	
 	allKeysRemoved = NO;
 	
-	// Pre-Write-Transaction: Step 5 of 5
-	//
-	// Add IsOnConnectionQueueKey flag to writeQueue.
-	// This allows various methods that depend on the flag to operate correctly.
-	
-	dispatch_queue_set_specific(database->writeQueue, IsOnConnectionQueueKey, IsOnConnectionQueueKey, NULL);
+	if (mutationStack == nil)
+		mutationStack = [[YapMutationStack_Bool alloc] init];
 }
 
 /**
@@ -1903,7 +2643,9 @@
 {
 	if (transaction->rollback)
 	{
-		// Rollback-Write-Transaction: Step 1 of 2
+		YDBLogVerbose(@"YapDatabaseConnection(%p) rollback read-write transaction", self);
+		
+		// Rollback-Write-Transaction: Step 1 of 3
 		//
 		// Update our connection state within the state table.
 		//
@@ -1916,7 +2658,7 @@
 			{
 				if (state->connection == self)
 				{
-					state->yapLevelExclusiveWriteLock = NO;
+					state->activeWriteTransaction = NO;
 					break;
 				}
 			}
@@ -1932,246 +2674,458 @@
 		//
 		// Reset any in-memory variables which may be out-of-sync with the database.
 		
-		[self postRollbackCleanup];
+		[objectCache removeAllObjects];
+		[metadataCache removeAllObjects];
 		
-		YDBLogVerbose(@"YapDatabaseConnection(%p) completing read-write transaction (rollback).", self);
+	}
+	else // if (!transaction->rollback)
+	{
+		// Post-Write-Transaction: Step 1 of 10
+		//
+		// Run any pre-commit operations.
+		// This allows extensions to to perform any cleanup before the changeset is requested.
 		
-		return;
+		[transaction preCommitReadWriteTransaction];
+		
+		// Post-Write-Transaction: Step 2 of 10
+		//
+		// Fetch changesets.
+		// Then update the snapshot in the 'yap' database (if any changes were made).
+		// We use 'yap' database and snapshot value to check for a race condition.
+		//
+		// The "internal" changeset gets sent directly to sibling database connections.
+		// The "external" changeset gets plugged into the YapDatabaseModifiedNotification as the userInfo dict.
+		
+		NSNotification *notification = nil;
+		
+		NSMutableDictionary *changeset = nil;
+		NSMutableDictionary *userInfo = nil;
+		
+		[self getInternalChangeset:&changeset externalChangeset:&userInfo];
+		if (changeset || userInfo || hasDiskChanges)
+		{
+			// If hasDiskChanges is YES, then the database file was modified.
+			// In this case, we're sure to write the incremented snapshot number to the database.
+			//
+			// If hasDiskChanges is NO, then the database file was not modified.
+			// However, something was "touched" or an in-memory extension was changed.
+			
+			if (hasDiskChanges || enableMultiProcessSupport)
+				snapshot = [self incrementSnapshotInDatabase];
+			else
+				snapshot++;
+			
+			if (changeset == nil)
+				changeset = [NSMutableDictionary dictionaryWithSharedKeySet:sharedKeySetForInternalChangeset];
+			
+			if (userInfo == nil)
+				userInfo = [NSMutableDictionary dictionaryWithSharedKeySet:sharedKeySetForExternalChangeset];
+			
+			[changeset setObject:@(snapshot) forKey:YapDatabaseSnapshotKey];
+			[userInfo setObject:@(snapshot) forKey:YapDatabaseSnapshotKey];
+			
+			[userInfo setObject:self forKey:YapDatabaseConnectionKey];
+		
+			if (externallyModified)
+				[changeset setObject:@(externallyModified) forKey:YapDatabaseModifiedExternallyKey];
+			
+			if (transaction->customObjectForNotification)
+				[userInfo setObject:transaction->customObjectForNotification forKey:YapDatabaseCustomKey];
+			
+			notification = [NSNotification notificationWithName:YapDatabaseModifiedNotification
+			                                             object:database
+			                                           userInfo:userInfo];
+			
+			[changeset setObject:notification forKey:YapDatabaseNotificationKey];
+		}
+		
+		// Post-Write-Transaction: Step 3 of 10
+		//
+		// Auto-drop tables from previous extensions that aren't being used anymore.
+		//
+		// Note the timing of when this happens:
+		// - Only once
+		// - At the end of a readwrite transaction that has made modifications to the database
+		// - Only if the modifications weren't dedicated to registering/unregistring an extension
+		
+		BOOL clearPreviouslyRegisteredExtensionNames = NO;
+		
+		if (changeset && !registeredExtensionsChanged && database->previouslyRegisteredExtensionNames)
+		{
+			for (NSString *prevExtensionName in database->previouslyRegisteredExtensionNames)
+			{
+				if ([registeredExtensions objectForKey:prevExtensionName] == nil)
+				{
+					[self _unregisterExtensionWithName:prevExtensionName transaction:transaction];
+				}
+			}
+			
+			clearPreviouslyRegisteredExtensionNames = YES;
+		}
+		
+		// Post-Write-Transaction: Step 4 of 10
+		//
+		// Check to see if it's safe to commit our changes.
+		//
+		// There may be read-only transactions that have acquired "yap-level" snapshots
+		// without "sql-level" snapshots. That is, these read-only transaction may have a snapshot
+		// of the in-memory metadata dictionary at the time they started, but as for the sqlite connection
+		// they only have a "BEGIN DEFERRED TRANSACTION", and haven't actually executed
+		// any "select" statements. Thus they haven't actually invoked the sqlite machinery to
+		// acquire the "sql-level" snapshot (last valid commit record in the WAL).
+		//
+		// It is our responsibility to block until all read-only transactions have either completed,
+		// or have acquired the necessary "sql-level" shared read lock.
+		//
+		// We avoid writer starvation by enforcing new read-only transactions that start after our writer
+		// started to immediately acquire "sql-level" shared read locks when they start.
+		// Thus we would only ever wait for read-only transactions that started before our
+		// read-write transaction started. And since most of the time the read-write transactions
+		// take longer than read-only transactions, we avoid any blocking in most cases.
+		
+		__block YapDatabaseConnectionState *myState = nil;
+		__block BOOL safeToCommit = NO;
+		
+		do
+		{
+			__block BOOL waitForReadOnlyTransactions = NO;
+			
+			dispatch_sync(database->snapshotQueue, ^{ @autoreleasepool {
+				
+				for (YapDatabaseConnectionState *state in database->connectionStates)
+				{
+					if (state->connection == self)
+					{
+						myState = state;
+					}
+					else if (state->activeReadTransaction && !state->sqlLevelSharedReadLock)
+					{
+						waitForReadOnlyTransactions = YES;
+					}
+				}
+				
+				NSAssert(myState != nil, @"Missing state in database->connectionStates");
+				
+				if (waitForReadOnlyTransactions)
+				{
+					myState->waitingForWriteLock = YES;
+					[myState prepareWriteLock];
+				}
+				else
+				{
+					myState->waitingForWriteLock = NO;
+					safeToCommit = YES;
+					
+					// Post-Write-Transaction: Step 5 of 10
+					//
+					// Register pending changeset with database.
+					// Our commit is actually a two step process.
+					// First we execute the sqlite level commit.
+					// Second we execute the final stages of the yap level commit.
+					//
+					// This two step process means we have an edge case,
+					// where another connection could come around and begin its yap level transaction
+					// before this connection's yap level commit, but after this connection's sqlite level commit.
+					//
+					// By registering the pending changeset in advance,
+					// we provide a near seamless workaround for the edge case.
+					
+					if (changeset)
+					{
+						[database notePendingChangeset:changeset fromConnection:self];
+					}
+					
+					if (clearPreviouslyRegisteredExtensionNames)
+					{
+						// It's only safe to clear this ivar within the snapshot queue
+						database->previouslyRegisteredExtensionNames = nil;
+					}
+				}
+				
+			}});
+		
+			if (waitForReadOnlyTransactions)
+			{
+				// Block until a read-only transaction signals us.
+				// This will occur when the last read-only transaction (that started before our read-write
+				// transaction started) either completes or acquires an "sql-level" shared read lock.
+				//
+				// Note: Since we're using a dispatch semaphore, order doesn't matter.
+				// That is, it's fine if the read-only transaction signals our write lock before we start waiting on it.
+				// In this case we simply return immediately from the wait call.
+				
+				YDBLogVerbose(@"YapDatabaseConnection(%p) blocked waiting for write lock...", self);
+				
+				[myState waitForWriteLock];
+			}
+			
+		} while (!safeToCommit);
+	
+		// Post-Write-Transaction: Step 6 of 10
+		//
+		// Execute "COMMIT TRANSACTION" on database connection.
+		// This will write the changes to the WAL, and may invoke a checkpoint.
+		//
+		// Notice that we do this outside the context of the transactionStateQueue.
+		// We do this so we don't block read-only transactions from starting or finishing.
+		// However, this does leave us open for the possibility that a read-only transaction will
+		// get a "yap-level" snapshot of the metadata dictionary before this commit,
+		// but a "sql-level" snapshot of the sql database after this commit.
+		// This is rare but must be guarded against.
+		// The solution is pretty simple and straight-forward.
+		// When a read-only transaction starts, if there's an active write transaction,
+		// it immediately acquires an "sql-level" snapshot. It does this by invoking a select statement,
+		// which invokes the internal sqlite snapshot machinery for the transaction.
+		// So rather than using a dummy select statement that we ignore, we instead select a lastCommit number
+		// from the database. If it doesn't match what we expect, then we know we've run into the race condition,
+		// and we make the read-only transaction back out and try again.
+		
+		[transaction commitTransaction];
+		
+		__block uint64_t minSnapshot = UINT64_MAX;
+	
+		dispatch_sync(database->snapshotQueue, ^{ @autoreleasepool {
+			
+			// Post-Write-Transaction: Step 7 of 10
+			//
+			// Notify database of changes, and drop reference to set of changed keys.
+			
+			if (changeset)
+			{
+				[database noteCommittedChangeset:changeset fromConnection:self];
+			}
+			
+			// Post-Write-Transaction: Step 8 of 10
+			//
+			// Update our connection state within the state table.
+			//
+			// We are the only write transaction for this database.
+			// It is important for read-only transactions on other connections to know we're no longer a writer.
+			
+			for (YapDatabaseConnectionState *state in database->connectionStates)
+			{
+				if (state->activeReadTransaction)
+				{
+					minSnapshot = MIN(state->lastTransactionSnapshot, minSnapshot);
+				}
+			}
+			
+			myState->activeWriteTransaction = NO;
+			myState->waitingForWriteLock = NO;
+			
+			YDBLogVerbose(@"YapDatabaseConnection(%p) completing read-write transaction.", self);
+		}});
+	
+		if (changeset)
+		{
+			// Post-Write-Transaction: Step 9 of 10
+			//
+			// We added frames to the WAL.
+			// We can invoke a checkpoint if there are no other active connections.
+			
+			if (minSnapshot == UINT64_MAX)
+			{
+				[database asyncCheckpoint:snapshot];
+				
+				[registeredMemoryTables enumerateKeysAndObjectsUsingBlock:
+				    ^(id __unused key, YapMemoryTable *memoryTable, BOOL __unused *stop)
+				{
+					[memoryTable asyncCheckpoint:snapshot];
+				}];
+			}
+		}
+	
+		// Post-Write-Transaction: Step 10 of 10
+		//
+		// Post YapDatabaseModifiedNotification (if needed)
+		
+		if (notification)
+		{
+			dispatch_async(dispatch_get_main_queue(), ^{
+				[[NSNotificationCenter defaultCenter] postNotification:notification];
+			});
+		}
+	
+	} // end else if (!transaction->rollback)
+	
+	
+	// Clear changeset variables (which are now a part of the notification)
+	
+	if ([objectChanges count] > 0)
+		objectChanges = nil;
+	
+	if ([metadataChanges count] > 0)
+		metadataChanges = nil;
+	
+	if ([removedKeys count] > 0)
+		removedKeys = nil;
+	
+	if ([removedCollections count] > 0)
+		removedCollections = nil;
+	
+	if ([removedRowids count] > 0)
+		removedRowids = nil;
+	
+	[mutationStack clear];
+	
+	// Drop IsOnConnectionQueueKey flag from writeQueue since we're exiting writeQueue.
+	
+	dispatch_queue_set_specific(database->writeQueue, IsOnConnectionQueueKey, NULL, NULL);
+}
+
+/**
+ * This method executes the state transition steps required before executing a pseudo read-write transaction.
+ *
+ * This method must be invoked from within the connectionQueue.
+ * This method must be invoked from within the database.writeQueue.
+**/
+- (void)prePseudoReadWriteTransaction
+{
+	// This is similar to a read-write transaction,
+	// in that we intend to block other writers (go through the writeQueue).
+	//
+	// However, our operation cannot occur within a transaction. (no "BEGIN TRANSCTION;" or "COMMIT TRANSACTION;")
+	// Thus we cannot simply use preReadWriteTransaction & postReadWriteTransaction.
+	// Instead we use a select subset of them.
+	
+	// Pre-Pseudo-Write-Transaction: Step 1 of 5
+	//
+	// Add IsOnConnectionQueueKey flag to writeQueue.
+	// This allows various methods that depend on the flag to operate correctly.
+	
+	dispatch_queue_set_specific(database->writeQueue, IsOnConnectionQueueKey, IsOnConnectionQueueKey, NULL);
+	
+	// Pre-Pseudo-Write-Transaction: Step 2 of 5
+	//
+	// Prep work: sqlite VFS shim listeners for read notifications (if needed).
+	// Initialize the 'main_file', if we haven't already.
+	
+	if (main_file == NULL)
+	{
+		sqlite3_file_control(db, "main", SQLITE_FCNTL_FILE_POINTER, &main_file);
+		if (main_file) {
+			main_file->yap_database_connection = (__bridge void *)self;
+		}
 	}
 	
-	// Post-Write-Transaction: Step 1 of 11
+	// Pre-Pseudo-Write-Transaction: Step 3 of 5
 	//
-	// Run any pre-commit operations.
-	// This allows extensions to to perform any cleanup before the changeset is requested.
-	
-	[transaction preCommitReadWriteTransaction];
-	
-	// Post-Write-Transaction: Step 2 of 11
+	// Update our connection state within the state table.
 	//
-	// Fetch changesets.
-	// Then update the snapshot in the 'yap' database (if any changes were made).
-	// We use 'yap' database and snapshot value to check for a race condition.
-	//
-	// The "internal" changeset gets sent directly to sibling database connections.
-	// The "external" changeset gets plugged into the YapDatabaseModifiedNotification as the userInfo dict.
+	// We are the only write transaction for this database.
+	// It is important for read-only transactions on other connections to know there's a writer.
 	
-	NSNotification *notification = nil;
+	dispatch_sync(database->snapshotQueue, ^{ @autoreleasepool {
+		
+		YapDatabaseConnectionState *myState = nil;
+		
+		for (YapDatabaseConnectionState *state in database->connectionStates)
+		{
+			if (state->connection == self)
+			{
+				myState = state;
+				myState->activeWriteTransaction = YES;
+			}
+		}
+		
+		NSAssert(myState != nil, @"Missing state in database->connectionStates");
+		
+		// Pre-Pseudo-Write-Transaction: Step 4 of 5
+		//
+		// Prep work: sqlite VFS shim listeners for read notifications (if needed).
+		// Initialize the 'wal_file', if we haven't already.
+		
+		if (wal_file == NULL)
+		{
+			// If sqlite hasn't opened the wal_file yet,
+			// then we need to invoke the sql machinery so we can get access to it.
+			// We need the wal_file in order to properly receive notifications of
+			// when sqlite acquires an "sql-level" snapshot.
+			
+			(void)[self readSnapshotFromDatabase];
+			
+			wal_file = yap_vfs_last_opened_wal(database->yap_vfs_shim);
+			if (wal_file) {
+				wal_file->yap_database_connection = (__bridge void *)self;
+			}
+		}
+		
+		myState->lastTransactionSnapshot = [database snapshot];
+		myState->lastTransactionTime = mach_absolute_time();
+		needsMarkSqlLevelSharedReadLock = YES;
+		
+		YDBLogVerbose(@"YapDatabaseConnection(%p) starting vacuum operation.", self);
+	}});
+	
+	// Pre-Pseudo-Write-Transaction: Step 5 of 5
+	//
+	// Setup write state and changeset variables.
+	
+	hasDiskChanges = NO;
+	
+	// Note: We don't need to setup all changeset variables.
+}
+
+/**
+ * This method executes the state transition steps required after executing a pseudo read-write transaction.
+ *
+ * This method must be invoked from within the connectionQueue.
+ * This method must be invoked from within the database.writeQueue.
+**/
+- (void)postPseudoReadWriteTransaction
+{
+	// This is similar to a read-write transaction,
+	// in that we intend to block other writers (go through the writeQueue).
+	//
+	// However, our operation cannot occur within a transaction. (no "BEGIN TRANSCTION;" or "COMMIT TRANSACTION;")
+	// Thus we cannot simply use preReadWriteTransaction & postReadWriteTransaction.
+	// Instead we use a select subset of them.
+	
+	// Post-Pseudo-Write-Transaction: Step 1 of 5
+	//
+	// Create changeset.
+	// We're doing this in order to increment the snapshot.
 	
 	NSMutableDictionary *changeset = nil;
 	NSMutableDictionary *userInfo = nil;
 	
-	[self getInternalChangeset:&changeset externalChangeset:&userInfo];
-	if (changeset || userInfo || hasDiskChanges)
+	NSNotification *notification = nil;
+	
+	if (hasDiskChanges)
 	{
-		// If hasDiskChanges is YES, then the database file was modified.
-		// In this case, we're sure to write the incremented snapshot number to the database.
-		//
-		// If hasDiskChanges is NO, then the database file was not modified.
-		// However, something was "touched" or an in-memory extension was changed.
+		snapshot++;
 		
-		if (hasDiskChanges)
-			snapshot = [self incrementSnapshotInDatabase];
-		else
-			snapshot++;
+		changeset = [NSMutableDictionary dictionaryWithSharedKeySet:sharedKeySetForInternalChangeset];
+		userInfo = [NSMutableDictionary dictionaryWithSharedKeySet:sharedKeySetForExternalChangeset];
 		
-		if (changeset == nil)
-			changeset = [NSMutableDictionary dictionaryWithSharedKeySet:sharedKeySetForInternalChangeset];
+		changeset[YapDatabaseSnapshotKey] = @(snapshot);
+		userInfo[YapDatabaseSnapshotKey] = @(snapshot);
 		
-		if (userInfo == nil)
-			userInfo = [NSMutableDictionary dictionaryWithSharedKeySet:sharedKeySetForExternalChangeset];
-		
-		[changeset setObject:@(snapshot) forKey:YapDatabaseSnapshotKey];
-		[userInfo setObject:@(snapshot) forKey:YapDatabaseSnapshotKey];
-		
-		[userInfo setObject:self forKey:YapDatabaseConnectionKey];
-		
-		if (transaction->customObjectForNotification)
-			[userInfo setObject:transaction->customObjectForNotification forKey:YapDatabaseCustomKey];
+		userInfo[YapDatabaseConnectionKey] = self;
 		
 		notification = [NSNotification notificationWithName:YapDatabaseModifiedNotification
 		                                             object:database
 		                                           userInfo:userInfo];
 		
-		[changeset setObject:notification forKey:YapDatabaseNotificationKey];
+		changeset[YapDatabaseNotificationKey] = notification;
 	}
-	
-	// Post-Write-Transaction: Step 3 of 11
-	//
-	// Auto-drop tables from previous extensions that aren't being used anymore.
-	//
-	// Note the timing of when this happens:
-	// - Only once
-	// - At the end of a readwrite transaction that has made modifications to the database
-	// - Only if the modifications weren't dedicated to registering/unregistring an extension
-	
-	if (database->previouslyRegisteredExtensionNames && changeset && !registeredExtensionsChanged)
-	{
-		for (NSString *prevExtensionName in database->previouslyRegisteredExtensionNames)
-		{
-			if ([registeredExtensions objectForKey:prevExtensionName] == nil)
-			{
-				NSString *className = [transaction stringValueForKey:@"class" extension:prevExtensionName];
-				Class class = NSClassFromString(className);
-				
-				if (className == nil)
-				{
-					YDBLogWarn(@"Unable to auto-unregister extension(%@). Doesn't appear to be registered.",
-					           prevExtensionName);
-				}
-				else if (class == NULL)
-				{
-					YDBLogError(@"Unable to auto-unregister extension(%@) with unknown class(%@)",
-					            prevExtensionName, className);
-				}
-				if (![class isSubclassOfClass:[YapDatabaseExtension class]])
-				{
-					YDBLogError(@"Unable to auto-unregister extension(%@) with improper class(%@)",
-					            prevExtensionName, className);
-				}
-				else
-				{
-					YDBLogInfo(@"Auto-unregistering extension(%@) with class(%@)",
-					            prevExtensionName, className);
-					
-					// Drop tables
-					[class dropTablesForRegisteredName:prevExtensionName withTransaction:transaction];
-					
-					// Drop preferences (rows in yap2 table)
-					[transaction removeAllValuesForExtension:prevExtensionName];
-				}
-			}
-		}
-		
-		database->previouslyRegisteredExtensionNames = nil;
-	}
-	
-	// Post-Write-Transaction: Step 4 of 11
-	//
-	// Check to see if it's safe to commit our changes.
-	//
-	// There may be read-only transactions that have acquired "yap-level" snapshots
-	// without "sql-level" snapshots. That is, these read-only transaction may have a snapshot
-	// of the in-memory metadata dictionary at the time they started, but as for the sqlite connection
-	// the only have a "BEGIN DEFERRED TRANSACTION", and haven't actually executed
-	// any "select" statements. Thus they haven't actually invoked the sqlite machinery to
-	// acquire the "sql-level" snapshot (last valid commit record in the WAL).
-	//
-	// It is our responsibility to block until all read-only transactions have either completed,
-	// or have acquired the necessary "sql-level" shared read lock.
-	//
-	// We avoid writer starvation by enforcing new read-only transactions that start after our writer
-	// started to immediately acquire "sql-level" shared read locks when they start.
-	// Thus we would only ever wait for read-only transactions that started before our
-	// read-write transaction started. And since most of the time the read-write transactions
-	// take longer than read-only transactions, we avoid any blocking in most cases.
 	
 	__block YapDatabaseConnectionState *myState = nil;
-	__block BOOL safeToCommit = NO;
-	
-	do
-	{
-		__block BOOL waitForReadOnlyTransactions = NO;
-		
-		dispatch_sync(database->snapshotQueue, ^{ @autoreleasepool {
-			
-			for (YapDatabaseConnectionState *state in database->connectionStates)
-			{
-				if (state->connection == self)
-				{
-					myState = state;
-				}
-				else if (state->yapLevelSharedReadLock && !state->sqlLevelSharedReadLock)
-				{
-					waitForReadOnlyTransactions = YES;
-				}
-			}
-			
-			NSAssert(myState != nil, @"Missing state in database->connectionStates");
-			
-			if (waitForReadOnlyTransactions)
-			{
-				myState->waitingForWriteLock = YES;
-				[myState prepareWriteLock];
-			}
-			else
-			{
-				myState->waitingForWriteLock = NO;
-				safeToCommit = YES;
-				
-				// Post-Write-Transaction: Step 5 of 11
-				//
-				// Register pending changeset with database.
-				// Our commit is actually a two step process.
-				// First we execute the sqlite level commit.
-				// Second we execute the final stages of the yap level commit.
-				//
-				// This two step process means we have an edge case,
-				// where another connection could come around and begin its yap level transaction
-				// before this connections yap level commit, but after this connections sqlite level commit.
-				//
-				// By registering the pending changeset in advance,
-				// we provide a near seamless workaround for the edge case.
-				
-				if (changeset)
-				{
-					[database notePendingChanges:changeset fromConnection:self];
-				}
-			}
-			
-		}});
-		
-		if (waitForReadOnlyTransactions)
-		{
-			// Block until a read-only transaction signals us.
-			// This will occur when the last read-only transaction (that started before our read-write
-			// transaction started) either completes or acquires an "sql-level" shared read lock.
-			//
-			// Note: Since we're using a dispatch semaphore, order doesn't matter.
-			// That is, it's fine if the read-only transaction signals our write lock before we start waiting on it.
-			// In this case we simply return immediately from the wait call.
-			
-			YDBLogVerbose(@"YapDatabaseConnection(%p) blocked waiting for write lock...", self);
-			
-			[myState waitForWriteLock];
-		}
-		
-	} while (!safeToCommit);
-	
-	// Post-Write-Transaction: Step 6 of 11
-	//
-	// Execute "COMMIT TRANSACTION" on database connection.
-	// This will write the changes to the WAL, and may invoke a checkpoint.
-	//
-	// Notice that we do this outside the context of the transactionStateQueue.
-	// We do this so we don't block read-only transactions from starting or finishing.
-	// However, this does leave us open for the possibility that a read-only transaction will
-	// get a "yap-level" snapshot of the metadata dictionary before this commit,
-	// but a "sql-level" snapshot of the sql database after this commit.
-	// This is rare but must be guarded against.
-	// The solution is pretty simple and straight-forward.
-	// When a read-only transaction starts, if there's an active write transaction,
-	// it immediately acquires an "sql-level" snapshot. It does this by invoking a select statement,
-	// which invokes the internal sqlite snapshot machinery for the transaction.
-	// So rather than using a dummy select statement that we ignore, we instead select a lastCommit number
-	// from the database. If it doesn't match what we expect, then we know we've run into the race condition,
-	// and we make the read-only transaction back out and try again.
-	
-	[transaction commitTransaction];
-	
 	__block uint64_t minSnapshot = UINT64_MAX;
 	
 	dispatch_sync(database->snapshotQueue, ^{ @autoreleasepool {
 		
-		// Post-Write-Transaction: Step 7 of 11
+		// Post-Pseudo-Write-Transaction: Step 2 of 5
 		//
 		// Notify database of changes, and drop reference to set of changed keys.
 		
 		if (changeset)
 		{
-			[database noteCommittedChanges:changeset fromConnection:self];
+			[database notePendingChangeset:changeset fromConnection:self];
+			[database noteCommittedChangeset:changeset fromConnection:self];
 		}
 		
-		// Post-Write-Transaction: Step 8 of 11
+		// Post-Pseudo-Write-Transaction: Step 3 of 5
 		//
 		// Update our connection state within the state table.
 		//
@@ -2180,22 +3134,28 @@
 		
 		for (YapDatabaseConnectionState *state in database->connectionStates)
 		{
-			if (state->yapLevelSharedReadLock)
+			if (state->connection == self)
 			{
-				minSnapshot = MIN(state->lastKnownSnapshot, minSnapshot);
+				myState = state;
+			}
+			else if (state->activeReadTransaction)
+			{
+				minSnapshot = MIN(state->lastTransactionSnapshot, minSnapshot);
 			}
 		}
 		
-		myState->yapLevelExclusiveWriteLock = NO;
+		NSAssert(myState != nil, @"Missing state in database->connectionStates");
+		
+		myState->activeWriteTransaction = NO;
 		myState->waitingForWriteLock = NO;
 		
 		YDBLogVerbose(@"YapDatabaseConnection(%p) completing read-write transaction.", self);
 	}});
 	
-	// Post-Write-Transaction: Step 9 of 11
-	
 	if (changeset)
 	{
+		// Post-Pseudo-Write-Transaction: Step 4 of 5
+		//
 		// We added frames to the WAL.
 		// We can invoke a checkpoint if there are no other active connections.
 		
@@ -2203,35 +3163,14 @@
 		{
 			[database asyncCheckpoint:snapshot];
 			
-			[registeredTables enumerateKeysAndObjectsUsingBlock:^(id key, id obj, BOOL *stop) {
-				
-				[(YapMemoryTable *)obj asyncCheckpoint:snapshot];
-			}];
+			// Note: We didn't actually change anything in the database.
+			// The vacuum operation just defragments the database file.
+			//
+			// So there's no need to do anything concerning registeredMemoryTables.
 		}
 	}
 	
-	// Post-Write-Transaction: Step 10 of 11
-	//
-	// Post YapDatabaseModifiedNotification (if needed),
-	// and clear changeset variables (which are now a part of the notification).
-	
-	if (notification)
-	{
-		dispatch_async(dispatch_get_main_queue(), ^{
-			[[NSNotificationCenter defaultCenter] postNotification:notification];
-		});
-	}
-	
-	if ([objectChanges count] > 0)
-		objectChanges = nil;
-	if ([metadataChanges count] > 0)
-		metadataChanges = nil;
-	if ([removedKeys count] > 0)
-		removedKeys = nil;
-	if ([removedCollections count] > 0)
-		removedCollections = nil;
-	
-	// Post-Write-Transaction: Step 11 of 11
+	// Post-Pseudo-Write-Transaction: Step 5 of 5
 	//
 	// Drop IsOnConnectionQueueKey flag from writeQueue since we're exiting writeQueue.
 	
@@ -2258,16 +3197,19 @@
 	
 	// SELECT data FROM 'yap2' WHERE extension = ? AND key = ? ;
 	
-	char *extension = "";
-	sqlite3_bind_text(statement, 1, extension, (int)strlen(extension), SQLITE_STATIC);
+	int const bind_idx_extension = SQLITE_BIND_START + 0;
+	int const bind_idx_key       = SQLITE_BIND_START + 1;
 	
-	char *key = "snapshot";
-	sqlite3_bind_text(statement, 2, key, (int)strlen(key), SQLITE_STATIC);
+	const char *extension = "";
+	sqlite3_bind_text(statement, bind_idx_extension, extension, (int)strlen(extension), SQLITE_STATIC);
+	
+	const char *key = "snapshot";
+	sqlite3_bind_text(statement, bind_idx_key, key, (int)strlen(key), SQLITE_STATIC);
 	
 	int status = sqlite3_step(statement);
 	if (status == SQLITE_ROW)
 	{
-		result = (uint64_t)sqlite3_column_int64(statement, 0);
+		result = (uint64_t)sqlite3_column_int64(statement, SQLITE_COLUMN_START);
 	}
 	else if (status == SQLITE_ERROR)
 	{
@@ -2293,13 +3235,17 @@
 	
 	// INSERT OR REPLACE INTO "yap2" ("extension", "key", "data") VALUES (?, ?, ?);
 	
-	char *extension = "";
-	sqlite3_bind_text(statement, 1, extension, (int)strlen(extension), SQLITE_STATIC);
+	int const bind_idx_extension = SQLITE_BIND_START + 0;
+	int const bind_idx_key       = SQLITE_BIND_START + 1;
+	int const bind_idx_data      = SQLITE_BIND_START + 2;
 	
-	char *key = "snapshot";
-	sqlite3_bind_text(statement, 2, key, (int)strlen(key), SQLITE_STATIC);
+	const char *extension = "";
+	sqlite3_bind_text(statement, bind_idx_extension, extension, (int)strlen(extension), SQLITE_STATIC);
 	
-	sqlite3_bind_int64(statement, 3, (sqlite3_int64)newSnapshot);
+	const char *key = "snapshot";
+	sqlite3_bind_text(statement, bind_idx_key, key, (int)strlen(key), SQLITE_STATIC);
+	
+	sqlite3_bind_int64(statement, bind_idx_data, (sqlite3_int64)newSnapshot);
 	
 	int status = sqlite3_step(statement);
 	if (status != SQLITE_DONE)
@@ -2321,7 +3267,7 @@
 	
 	__block YapDatabaseConnectionState *writeStateToSignal = nil;
 	
-	dispatch_sync(database->snapshotQueue, ^{ @autoreleasepool {
+	dispatch_block_t block = ^{ @autoreleasepool {
 		
 		// Update our connection state within the state table.
 		//
@@ -2349,7 +3295,7 @@
 			{
 				state->sqlLevelSharedReadLock = YES;
 			}
-			else if (state->yapLevelSharedReadLock && !state->sqlLevelSharedReadLock)
+			else if (state->activeReadTransaction && !state->sqlLevelSharedReadLock)
 			{
 				countOtherMaybeBlockingWriteTransaction++;
 			}
@@ -2363,7 +3309,12 @@
 		{
 			writeStateToSignal = blockedWriteState;
 		}
-	}});
+	}};
+	
+	if (dispatch_get_specific(database->IsOnSnapshotQueueKey))
+		block();
+	else
+		dispatch_sync(database->snapshotQueue, block);
 	
 	needsMarkSqlLevelSharedReadLock = NO;
 	
@@ -2373,25 +3324,6 @@
 											 self, writeStateToSignal->connection);
 		[writeStateToSignal signalWriteLock];
 	}
-}
-
-/**
- * This method is invoked after a read-write transaction completes, which was rolled-back.
- * You should flush anything from memory that may be out-of-sync with the database.
-**/
-- (void)postRollbackCleanup
-{
-	[objectCache removeAllObjects];
-	[metadataCache removeAllObjects];
-	
-	if ([objectChanges count] > 0)
-		objectChanges = nil;
-	if ([metadataChanges count] > 0)
-		metadataChanges = nil;
-	if ([removedKeys count] > 0)
-		removedKeys = nil;
-	if ([removedCollections count] > 0)
-		removedCollections = nil;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -2461,7 +3393,7 @@
 			
 			for (NSDictionary *changeset in pendingChangesets)
 			{
-				[self noteCommittedChanges:changeset];
+				[self noteCommittedChangeset:changeset];
 				
 				NSNotification *notification = [changeset objectForKey:YapDatabaseNotificationKey];
 				if (notification) {
@@ -2524,6 +3456,105 @@
 		dispatch_async(connectionQueue, block);
 }
 
+/**
+ * Long-lived read transactions are a great way to achive stability, especially in places like the main-thread.
+ * However, they pose a unique problem. These long-lived transactions often start out by
+ * locking the WAL (write ahead log). This prevents the WAL from ever getting reset,
+ * and thus causes the WAL to potentially grow infinitely large. In order to allow the WAL to get properly reset,
+ * we need the long-lived read transactions to "reset". That is, without changing their stable state (their snapshot),
+ * we need them to restart the transaction, but this time without locking this WAL.
+ * 
+ * In other words, if commit X is the most recent commit, and the connection is reading commit X from the WAL,
+ * then we want to reset the connection such that it's reading commit X directly from the database file.
+ * This will mean the WAL is no longer locked, and can be reset on the next write.
+ * 
+ * We use the maybeResetLongLivedReadTransaction method to achieve this.
+**/
+- (void)maybeResetLongLivedReadTransaction
+{
+	// Async dispatch onto the writeQueue so we know there aren't any other active readWrite transactions
+	
+	dispatch_async(database->writeQueue, ^{
+		
+		// Pause the writeQueue so readWrite operations can't interfere with us.
+		// We abort if our connection has a readWrite transaction pending.
+		
+		BOOL abort = NO;
+		
+		OSSpinLockLock(&lock);
+		{
+			if (activeReadWriteTransaction) {
+				abort = YES;
+			}
+			else if (!writeQueueSuspended) {
+				dispatch_suspend(database->writeQueue);
+				writeQueueSuspended = YES;
+			}
+		}
+		OSSpinLockUnlock(&lock);
+		
+		if (abort) return;
+		
+		// Async dispatch onto our connectionQueue.
+		
+		dispatch_async(connectionQueue, ^{
+			
+			// If possible, silently reset the longLivedReadTransaction (same snapshot, no longer locking the WAL)
+			
+			BOOL writeQueueStillSuspended = NO;
+			OSSpinLockLock(&lock);
+			{
+				writeQueueStillSuspended = writeQueueSuspended;
+			}
+			OSSpinLockUnlock(&lock);
+			
+			if (writeQueueStillSuspended && longLivedReadTransaction && (snapshot == [database snapshot]))
+			{
+				NSArray *empty = [self beginLongLivedReadTransaction];
+				
+				if ([empty count] != 0)
+				{
+					YDBLogError(@"Core logic failure! "
+					            @"Silent longLivedReadTransaction reset resulted in non-empty notification array!");
+				}
+			}
+			
+			// Resume the writeQueue
+			
+			OSSpinLockLock(&lock);
+			{
+				if (writeQueueSuspended) {
+					dispatch_resume(database->writeQueue);
+					writeQueueSuspended = NO;
+				}
+			}
+			OSSpinLockUnlock(&lock);
+		});
+	});
+}
+
+NS_INLINE void __preWriteQueue(YapDatabaseConnection *connection)
+{
+	OSSpinLockLock(&connection->lock);
+	{
+		if (connection->writeQueueSuspended) {
+			dispatch_resume(connection->database->writeQueue);
+			connection->writeQueueSuspended = NO;
+		}
+		connection->activeReadWriteTransaction = YES;
+	}
+	OSSpinLockUnlock(&connection->lock);
+}
+
+NS_INLINE void __postWriteQueue(YapDatabaseConnection *connection)
+{
+	OSSpinLockLock(&connection->lock);
+	{
+		connection->activeReadWriteTransaction = NO;
+	}
+	OSSpinLockUnlock(&connection->lock);
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 #pragma mark Changeset Architecture
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -2539,14 +3570,17 @@
 	return @[ YapDatabaseSnapshotKey,
 	          YapDatabaseExtensionsKey,
 	          YapDatabaseRegisteredExtensionsKey,
-	          YapDatabaseRegisteredTablesKey,
-			  YapDatabaseExtensionsOrderKey,
+	          YapDatabaseRegisteredMemoryTablesKey,
+	          YapDatabaseExtensionsOrderKey,
+	          YapDatabaseExtensionDependenciesKey,
 	          YapDatabaseNotificationKey,
 	          YapDatabaseObjectChangesKey,
 	          YapDatabaseMetadataChangesKey,
 	          YapDatabaseRemovedKeysKey,
 	          YapDatabaseRemovedCollectionsKey,
-	          YapDatabaseAllKeysRemovedKey ];
+	          YapDatabaseRemovedRowidsKey,
+	          YapDatabaseAllKeysRemovedKey,
+	          YapDatabaseModifiedExternallyKey ];
 }
 
 /**
@@ -2565,7 +3599,8 @@
 	          YapDatabaseMetadataChangesKey,
 	          YapDatabaseRemovedKeysKey,
 	          YapDatabaseRemovedCollectionsKey,
-	          YapDatabaseAllKeysRemovedKey ];
+	          YapDatabaseAllKeysRemovedKey,
+	          YapDatabaseModifiedExternallyKey ];
 }
 
 /**
@@ -2588,7 +3623,7 @@
 	__block NSMutableDictionary *internalChangeset_extensions = nil;
 	__block NSMutableDictionary *externalChangeset_extensions = nil;
 	
-	[extensions enumerateKeysAndObjectsUsingBlock:^(id extName, id extConnectionObj, BOOL *stop) {
+	[extensions enumerateKeysAndObjectsUsingBlock:^(id extName, id extConnectionObj, BOOL __unused *stop) {
 		
 		__unsafe_unretained YapDatabaseExtensionConnection *extConnection = extConnectionObj;
 		
@@ -2644,14 +3679,15 @@
 		
 		[internalChangeset setObject:registeredExtensions forKey:YapDatabaseRegisteredExtensionsKey];
 		[internalChangeset setObject:extensionsOrder forKey:YapDatabaseExtensionsOrderKey];
+		[internalChangeset setObject:extensionDependencies forKey:YapDatabaseExtensionDependenciesKey];
 	}
 	
-	if (registeredTablesChanged)
+	if (registeredMemoryTablesChanged)
 	{
 		if (internalChangeset == nil)
 			internalChangeset = [NSMutableDictionary dictionaryWithSharedKeySet:sharedKeySetForInternalChangeset];
 		
-		[internalChangeset setObject:registeredTables forKey:YapDatabaseRegisteredTablesKey];
+		[internalChangeset setObject:registeredMemoryTables forKey:YapDatabaseRegisteredMemoryTablesKey];
 	}
 	
 	// Step 2 of 2 - Process database changes
@@ -2662,7 +3698,8 @@
 	if ([objectChanges count]      > 0 ||
 		[metadataChanges count]    > 0 ||
 		[removedKeys count]        > 0 ||
-		[removedCollections count] > 0 || allKeysRemoved)
+		[removedCollections count] > 0 ||
+	    [removedRowids count]      > 0 || allKeysRemoved)
 	{
 		if (internalChangeset == nil)
 			internalChangeset = [NSMutableDictionary dictionaryWithSharedKeySet:sharedKeySetForInternalChangeset];
@@ -2672,42 +3709,52 @@
 		
 		if ([objectChanges count] > 0)
 		{
-			[internalChangeset setObject:objectChanges forKey:YapDatabaseObjectChangesKey];
+			internalChangeset[YapDatabaseObjectChangesKey] = objectChanges;
 			
 			YapSet *immutableObjectChanges = [[YapSet alloc] initWithDictionary:objectChanges];
-			[externalChangeset setObject:immutableObjectChanges forKey:YapDatabaseObjectChangesKey];
+			externalChangeset[YapDatabaseObjectChangesKey] = immutableObjectChanges;
 		}
 		
 		if ([metadataChanges count] > 0)
 		{
-			[internalChangeset setObject:metadataChanges forKey:YapDatabaseMetadataChangesKey];
+			internalChangeset[YapDatabaseMetadataChangesKey] = metadataChanges;
 			
 			YapSet *immutableMetadataChanges = [[YapSet alloc] initWithDictionary:metadataChanges];
-			[externalChangeset setObject:immutableMetadataChanges forKey:YapDatabaseMetadataChangesKey];
+			externalChangeset[YapDatabaseMetadataChangesKey] = immutableMetadataChanges;
 		}
 		
 		if ([removedKeys count] > 0)
 		{
-			[internalChangeset setObject:removedKeys forKey:YapDatabaseRemovedKeysKey];
+			internalChangeset[YapDatabaseRemovedKeysKey] = removedKeys;
 			
 			YapSet *immutableRemovedKeys = [[YapSet alloc] initWithSet:removedKeys];
-			[externalChangeset setObject:immutableRemovedKeys forKey:YapDatabaseRemovedKeysKey];
+			externalChangeset[YapDatabaseRemovedKeysKey] = immutableRemovedKeys;
 		}
 		
 		if ([removedCollections count] > 0)
 		{
-			[internalChangeset setObject:removedCollections forKey:YapDatabaseRemovedCollectionsKey];
+			internalChangeset[YapDatabaseRemovedCollectionsKey] = removedCollections;
 			
 			YapSet *immutableRemovedCollections = [[YapSet alloc] initWithSet:removedCollections];
-			[externalChangeset setObject:immutableRemovedCollections
-			                      forKey:YapDatabaseRemovedCollectionsKey];
+			externalChangeset[YapDatabaseRemovedCollectionsKey] = immutableRemovedCollections;
+		}
+		
+		if ([removedRowids count] > 0)
+		{
+			internalChangeset[YapDatabaseRemovedRowidsKey] = removedRowids;
 		}
 		
 		if (allKeysRemoved)
 		{
-			[internalChangeset setObject:@(YES) forKey:YapDatabaseAllKeysRemovedKey];
-			[externalChangeset setObject:@(YES) forKey:YapDatabaseAllKeysRemovedKey];
+			internalChangeset[YapDatabaseAllKeysRemovedKey] = @(YES);
+			externalChangeset[YapDatabaseAllKeysRemovedKey] = @(YES);
 		}
+        
+        if (externallyModified)
+        {
+            internalChangeset[YapDatabaseModifiedExternallyKey] = @(YES);
+            externalChangeset[YapDatabaseModifiedExternallyKey] = @(YES);
+        }
 	}
 	
 	*internalChangesetPtr = internalChangeset;
@@ -2731,6 +3778,7 @@
 		
 		registeredExtensions = changeset_registeredExtensions;
 		extensionsOrder = [changeset objectForKey:YapDatabaseExtensionsOrderKey];
+		extensionDependencies = [changeset objectForKey:YapDatabaseExtensionDependenciesKey];
 		
 		// Remove any extensions that have been dropped
 		
@@ -2752,47 +3800,74 @@
 	
 	// Did registered memory tables change ?
 	
-	NSDictionary *changeset_registeredTables = [changeset objectForKey:YapDatabaseRegisteredTablesKey];
-	if (changeset_registeredTables)
+	NSDictionary *changeset_registeredMemoryTables = [changeset objectForKey:YapDatabaseRegisteredMemoryTablesKey];
+	if (changeset_registeredMemoryTables)
 	{
-		// Retain new list
-		registeredTables = changeset_registeredTables;
+		registeredMemoryTables = changeset_registeredMemoryTables;
 	}
 	
-	// Allow extensions to process their individual changesets
-	
-	NSDictionary *changeset_extensions = [changeset objectForKey:YapDatabaseExtensionsKey];
-	if (changeset_extensions)
-	{
-		// Use existing extensions (extensions ivar, not [self extensions]).
-		// There's no need to create any new extConnections at this point.
-		
-		[extensions enumerateKeysAndObjectsUsingBlock:^(id extName, id extConnectionObj, BOOL *stop) {
-			
-			__unsafe_unretained YapDatabaseExtensionConnection *extConnection = extConnectionObj;
-			
-			NSDictionary *changeset_extensions_extName = [changeset_extensions objectForKey:extName];
-			if (changeset_extensions_extName)
-			{
-				[extConnection processChangeset:changeset_extensions_extName];
-			}
-		}];
-	}
-	
-	// Process normal database changset information
+	// Process normal database changeset information
 	
 	NSDictionary *changeset_objectChanges   =  [changeset objectForKey:YapDatabaseObjectChangesKey];
 	NSDictionary *changeset_metadataChanges =  [changeset objectForKey:YapDatabaseMetadataChangesKey];
 	
-	NSSet *changeset_removedKeys        =  [changeset objectForKey:YapDatabaseRemovedKeysKey];
-	NSSet *changeset_removedCollections =  [changeset objectForKey:YapDatabaseRemovedCollectionsKey];
+	NSSet *changeset_removedRowids      = [changeset objectForKey:YapDatabaseRemovedRowidsKey];
+	NSSet *changeset_removedKeys        = [changeset objectForKey:YapDatabaseRemovedKeysKey];
+	NSSet *changeset_removedCollections = [changeset objectForKey:YapDatabaseRemovedCollectionsKey];
 	
+	BOOL changeset_modifiedExternally = [[changeset objectForKey:YapDatabaseModifiedExternallyKey] boolValue];
 	BOOL changeset_allKeysRemoved = [[changeset objectForKey:YapDatabaseAllKeysRemovedKey] boolValue];
 	
 	BOOL hasObjectChanges      = [changeset_objectChanges count] > 0;
 	BOOL hasMetadataChanges    = [changeset_metadataChanges count] > 0;
 	BOOL hasRemovedKeys        = [changeset_removedKeys count] > 0;
 	BOOL hasRemovedCollections = [changeset_removedCollections count] > 0;
+	
+	// Check for external modification (special case)
+	
+	if (changeset_modifiedExternally)
+	{
+		NSUInteger flags = YapDatabaseConnectionFlushMemoryFlags_Caches |
+		                   YapDatabaseConnectionFlushMemoryFlags_Extension_State;
+		
+		[self _flushMemoryWithFlags:flags];
+	}
+	
+	// Update keyCache
+	
+	if (changeset_allKeysRemoved)
+	{
+		// Shortcut: Everything was removed from the database
+		
+		[keyCache removeAllObjects];
+	}
+	else
+	{
+		if (changeset_removedRowids)
+		{
+			[keyCache removeObjectsForKeys:changeset_removedRowids];
+		}
+		
+		if (hasRemovedCollections)
+		{
+			__block NSMutableArray *toRemove = nil;
+			[keyCache enumerateKeysAndObjectsWithBlock:^(id key, id obj, BOOL __unused *stop) {
+				
+				__unsafe_unretained NSNumber *rowidNumber = (NSNumber *)key;
+				__unsafe_unretained YapCollectionKey *collectionKey = (YapCollectionKey *)obj;
+				
+				if ([changeset_removedCollections containsObject:collectionKey.collection])
+				{
+					if (toRemove == nil)
+						toRemove = [NSMutableArray array];
+					
+					[toRemove addObject:rowidNumber];
+				}
+			}];
+			
+			[keyCache removeObjectsForKeys:toRemove];
+		}
+	}
 	
 	// Update objectCache
 	
@@ -2813,7 +3888,7 @@
 		BOOL isPolicyContainment = (objectPolicy == YapDatabasePolicyContainment);
 		BOOL isPolicyShare       = (objectPolicy == YapDatabasePolicyShare);
 		
-		[changeset_objectChanges enumerateKeysAndObjectsUsingBlock:^(id key, id newObject, BOOL *stop) {
+		[changeset_objectChanges enumerateKeysAndObjectsUsingBlock:^(id key, id newObject, BOOL __unused *stop) {
 			
 			__unsafe_unretained YapCollectionKey *cacheKey = (YapCollectionKey *)key;
 			
@@ -2850,7 +3925,7 @@
 		NSMutableArray *keysToUpdate = [NSMutableArray arrayWithCapacity:updateCapacity];
 		NSMutableArray *keysToRemove = [NSMutableArray arrayWithCapacity:removeCapacity];
 		
-		[objectCache enumerateKeysWithBlock:^(id key, BOOL *stop) {
+		[objectCache enumerateKeysWithBlock:^(id key, BOOL __unused *stop) {
 			
 			// Order matters.
 			// Consider the following database change:
@@ -2925,7 +4000,7 @@
 		BOOL isPolicyContainment = (metadataPolicy == YapDatabasePolicyContainment);
 		BOOL isPolicyShare       = (metadataPolicy == YapDatabasePolicyShare);
 		
-		[changeset_metadataChanges enumerateKeysAndObjectsUsingBlock:^(id key, id newMetadata, BOOL *stop) {
+		[changeset_metadataChanges enumerateKeysAndObjectsUsingBlock:^(id key, id newMetadata, BOOL __unused *stop) {
 			
 			__unsafe_unretained YapCollectionKey *cacheKey = (YapCollectionKey *)key;
 			
@@ -2962,7 +4037,7 @@
 		NSMutableArray *keysToUpdate = [NSMutableArray arrayWithCapacity:updateCapacity];
 		NSMutableArray *keysToRemove = [NSMutableArray arrayWithCapacity:removeCapacity];
 		
-		[metadataCache enumerateKeysWithBlock:^(id key, BOOL *stop) {
+		[metadataCache enumerateKeysWithBlock:^(id key, BOOL __unused *stop) {
 			
 			// Order matters.
 			// Consider the following database change:
@@ -3024,25 +4099,11 @@
  *
  * This method is invoked with the changeset from a sibling connection.
 **/
-- (void)noteCommittedChanges:(NSDictionary *)changeset
+- (void)noteCommittedChangeset:(NSDictionary *)changeset
 {
 	// This method must be invoked from within connectionQueue.
-	// It may be invoked from:
-	//
-	// 1. [database noteCommittedChanges:fromConnection:]
-	//   via dispatch_async(connectionQueue, ...)
-	//
-	// 2. [self  preReadTransaction:]
-	//   via dispatch_X(connectionQueue) -> dispatch_sync(database->snapshotQueue)
-	//
-	// 3. [self preReadWriteTransaction:]
-	//   via dispatch_X(connectionQueue) -> dispatch_sync(database->snapshotQueue)
-	//
-	// In case 1 (the common case) we can see IsOnConnectionQueueKey.
-	// In case 2 & 3 (the edge cases) we can see IsOnSnapshotQueueKey.
 	
-	NSAssert(dispatch_get_specific(IsOnConnectionQueueKey) ||
-			 dispatch_get_specific(database->IsOnSnapshotQueueKey), @"Must be invoked within connectionQueue");
+	NSAssert(dispatch_get_specific(IsOnConnectionQueueKey), @"Must be invoked within connectionQueue");
 	
 	// Grab the new snapshot.
 	// This tells us the minimum snapshot we could get if we started a transaction right now.
@@ -3074,16 +4135,16 @@
 	
 	if (longLivedReadTransaction)
 	{
-		if (dispatch_get_specific(database->IsOnSnapshotQueueKey))
+		if (isFastForwarding)
 		{
-			// This method is being invoked from preReadTransaction:.
-			// We are to process the changeset for it.
+			// This method is being invoked from preReadTransaction or preReadWriteTransaction.
+			// We need to process the changeset for it.
 			
 			[processedChangesets addObject:changeset];
 		}
 		else
 		{
-			// This method is being invoked from [database noteCommittedChanges:].
+			// This method is being invoked from [database noteCommittedChangeset:].
 			// We cannot process the changeset yet.
 			// We must wait for the longLivedReadTransaction to be reset.
 			
@@ -3100,8 +4161,35 @@
 	YDBLogVerbose(@"Processing changeset %lu for connection %@, database %@",
 	              (unsigned long)changesetSnapshot, self, database);
 	
-	snapshot = changesetSnapshot;
-	[self processChangeset:changeset];
+	if (snapshot == changesetSnapshot - 1)
+	{
+		snapshot = changesetSnapshot;
+		[self processChangeset:changeset];
+	}
+	else
+	{
+		// Snapshot numbers do not match: there might have been a modification from another process.
+		// We should flush cache and then process the changeset.
+		
+		snapshot = changesetSnapshot;
+		
+		NSUInteger flags = YapDatabaseConnectionFlushMemoryFlags_Caches |
+		                   YapDatabaseConnectionFlushMemoryFlags_Extension_State;
+		
+		[self _flushMemoryWithFlags:flags];
+		[self processChangeset:changeset];
+	}
+	
+	// Allow extensions to process their individual changesets
+	//
+	// Use existing extensions (extensions ivar, not [self extensions]).
+	// There's no need to create any new extConnections at this point.
+		
+	[extensions enumerateKeysAndObjectsUsingBlock:
+	    ^(NSString *extName, YapDatabaseExtensionConnection *extConnection, BOOL __unused *stop)
+	{
+		[extConnection noteCommittedChangeset:changeset registeredName:extName];
+	}];
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -3163,6 +4251,10 @@
 		if ([changeset_removedCollections containsObject:collection])
 			return YES;
 		
+        BOOL changeset_modifiedExternally = [[changeset objectForKey:YapDatabaseModifiedExternallyKey] boolValue];
+        if (changeset_modifiedExternally)
+            return YES;
+        
 		BOOL changeset_allKeysRemoved = [[changeset objectForKey:YapDatabaseAllKeysRemovedKey] boolValue];
 		if (changeset_allKeysRemoved)
 			return YES;
@@ -3203,6 +4295,7 @@
  includingObjectChanges:(BOOL)includeObjectChanges
         metadataChanges:(BOOL)includeMetadataChanges
 {
+	if (key == nil) return NO;
 	if (collection == nil)
 		collection = @"";
 	
@@ -3240,6 +4333,10 @@
 		if ([changeset_removedCollections containsObject:collection])
 			return YES;
 		
+        BOOL changeset_modifiedExternally = [[changeset objectForKey:YapDatabaseModifiedExternallyKey] boolValue];
+        if (changeset_modifiedExternally)
+            return YES;
+        
 		BOOL changeset_allKeysRemoved = [[changeset objectForKey:YapDatabaseAllKeysRemovedKey] boolValue];
 		if (changeset_allKeysRemoved)
 			return YES;
@@ -3348,6 +4445,10 @@
 		YapSet *changeset_removedCollections = [changeset objectForKey:YapDatabaseRemovedCollectionsKey];
 		if ([changeset_removedCollections containsObject:collection])
 			return YES;
+        
+        BOOL changeset_modifiedExternally = [[changeset objectForKey:YapDatabaseModifiedExternallyKey] boolValue];
+        if (changeset_modifiedExternally)
+            return YES;
 		
 		BOOL changeset_allKeysRemoved = [[changeset objectForKey:YapDatabaseAllKeysRemovedKey] boolValue];
 		if (changeset_allKeysRemoved)
@@ -3388,6 +4489,234 @@
 	                 inNotifications:notifications
 	          includingObjectChanges:NO
 	                 metadataChanges:YES];
+}
+
+// Advanced query techniques
+
+/**
+ * Returns YES if [transaction removeAllObjectsInCollection:] was invoked on the collection,
+ * or if [transaction removeAllObjectsInAllCollections] was invoked
+ * during any of the commits represented by the given notifications.
+ * 
+ * If this was the case then YapDatabase may not have tracked every single key within the collection.
+ * And thus a key that was removed via clearing the collection may not show up while enumerating changedKeys.
+ *
+ * This method is designed to be used in conjunction with the enumerateChangedKeys.... methods (below).
+ * The hasChange... methods (above) already take this into account.
+**/
+- (BOOL)didClearCollection:(NSString *)collection inNotifications:(NSArray *)notifications
+{
+	if (collection == nil)
+		collection = @"";
+	
+	for (NSNotification *notification in notifications)
+	{
+		if (![notification isKindOfClass:[NSNotification class]])
+		{
+			YDBLogWarn(@"%@ - notifications parameter contains non-NSNotification object", THIS_METHOD);
+			continue;
+		}
+		
+		NSDictionary *changeset = notification.userInfo;
+		
+		YapSet *changeset_removedCollections = [changeset objectForKey:YapDatabaseRemovedCollectionsKey];
+		if ([changeset_removedCollections containsObject:collection])
+			return YES;
+        
+        BOOL changeset_modifiedExternally = [[changeset objectForKey:YapDatabaseModifiedExternallyKey] boolValue];
+        if (changeset_modifiedExternally)
+            return YES;
+		
+		BOOL changeset_allKeysRemoved = [[changeset objectForKey:YapDatabaseAllKeysRemovedKey] boolValue];
+		if (changeset_allKeysRemoved)
+			return YES;
+	}
+	
+	return NO;
+}
+
+/**
+ * Returns YES if [transaction removeAllObjectsInAllCollections] was invoked
+ * during any of the commits represented by the given notifications.
+ *
+ * If this was the case then YapDatabase may not have tracked every single key within every single collection.
+ * And thus a key that was removed via clearing the database may not show up while enumerating changedKeys.
+ *
+ * This method is designed to be used in conjunction with the enumerateChangedKeys.... methods (below).
+ * The hasChange... methods (above) already take this into account.
+**/
+- (BOOL)didClearAllCollectionsInNotifications:(NSArray *)notifications
+{
+	for (NSNotification *notification in notifications)
+	{
+		if (![notification isKindOfClass:[NSNotification class]])
+		{
+			YDBLogWarn(@"%@ - notifications parameter contains non-NSNotification object", THIS_METHOD);
+			continue;
+		}
+		
+		NSDictionary *changeset = notification.userInfo;
+		
+        BOOL changeset_modifiedExternally = [[changeset objectForKey:YapDatabaseModifiedExternallyKey] boolValue];
+        if (changeset_modifiedExternally)
+            return YES;
+        
+		BOOL changeset_allKeysRemoved = [[changeset objectForKey:YapDatabaseAllKeysRemovedKey] boolValue];
+		if (changeset_allKeysRemoved)
+			return YES;
+	}
+	
+	return NO;
+}
+
+/**
+ * Allows you to enumerate all the changed keys in the given collection, for the given commits.
+ *
+ * Keep in mind that if [transaction removeAllObjectsInCollection:] was invoked on the given collection
+ * or [transaction removeAllObjectsInAllCollections] was invoked
+ * during any of the commits represented by the given notifications,
+ * then the key may not be included in the enumeration.
+ * You must use didClearCollection:inNotifications: or didClearAllCollectionsInNotifications:
+ * if you need to handle that case.
+ *
+ * @see didClearCollection:inNotifications:
+ * @see didClearAllCollectionsInNotifications:
+**/
+- (void)enumerateChangedKeysInCollection:(NSString *)collection
+                         inNotifications:(NSArray *)notifications
+                              usingBlock:(void (^)(NSString *key, BOOL *stop))block
+{
+	if (block == NULL) return;
+	if (collection == nil)
+		collection = @"";
+	
+	BOOL stop = NO;
+	NSMutableSet *keys = [NSMutableSet set];
+	
+	for (NSNotification *notification in notifications)
+	{
+		if (![notification isKindOfClass:[NSNotification class]])
+		{
+			YDBLogWarn(@"%@ - notifications parameter contains non-NSNotification object", THIS_METHOD);
+			continue;
+		}
+		
+		NSDictionary *changeset = notification.userInfo;
+		
+		YapSet *changeset_objectChanges = [changeset objectForKey:YapDatabaseObjectChangesKey];
+		for (YapCollectionKey *ck in changeset_objectChanges)
+		{
+			if ([ck.collection isEqualToString:collection])
+			{
+				if (![keys containsObject:ck.key])
+				{
+					block(ck.key, &stop);
+					if (stop) return;
+					
+					[keys addObject:ck.key];
+				}
+			}
+		}
+		
+		YapSet *changeset_metadataChanges = [changeset objectForKey:YapDatabaseMetadataChangesKey];
+		for (YapCollectionKey *ck in changeset_metadataChanges)
+		{
+			if ([ck.collection isEqualToString:collection])
+			{
+				if (![keys containsObject:ck.key])
+				{
+					block(ck.key, &stop);
+					if (stop) return;
+					
+					[keys addObject:ck.key];
+				}
+			}
+		}
+		
+		YapSet *changeset_removedKeys = [changeset objectForKey:YapDatabaseRemovedKeysKey];
+		for (YapCollectionKey *ck in changeset_removedKeys)
+		{
+			if ([ck.collection isEqualToString:collection])
+			{
+				if (![keys containsObject:ck.key])
+				{
+					block(ck.key, &stop);
+					if (stop) return;
+					
+					[keys addObject:ck.key];
+				}
+			}
+		}
+	}
+}
+
+/**
+ * Allows you to enumerate all the changed collection/key tuples for the given commits.
+ *
+ * Keep in mind that if [transaction removeAllObjectsInCollection:] was invoked on the given collection
+ * or [transaction removeAllObjectsInAllCollections] was invoked
+ * during any of the commits represented by the given notifications,
+ * then the collection/key tuple may not be included in the enumeration.
+ * You must use didClearCollection:inNotifications: or didClearAllCollectionsInNotifications:
+ * if you need to handle that case.
+ *
+ * @see didClearCollection:inNotifications:
+ * @see didClearAllCollectionsInNotifications:
+**/
+- (void)enumerateChangedCollectionKeysInNotifications:(NSArray *)notifications
+                                           usingBlock:(void (^)(YapCollectionKey *ck, BOOL *stop))block
+{
+	if (block == NULL) return;
+	
+	BOOL stop = NO;
+	NSMutableSet *collectionKeys = [NSMutableSet set];
+	
+	for (NSNotification *notification in notifications)
+	{
+		if (![notification isKindOfClass:[NSNotification class]])
+		{
+			YDBLogWarn(@"%@ - notifications parameter contains non-NSNotification object", THIS_METHOD);
+			continue;
+		}
+		
+		NSDictionary *changeset = notification.userInfo;
+		
+		YapSet *changeset_objectChanges = [changeset objectForKey:YapDatabaseObjectChangesKey];
+		for (YapCollectionKey *ck in changeset_objectChanges)
+		{
+			if (![collectionKeys containsObject:ck])
+			{
+				block(ck, &stop);
+				if (stop) return;
+				
+				[collectionKeys addObject:ck];
+			}
+		}
+		
+		YapSet *changeset_metadataChanges = [changeset objectForKey:YapDatabaseMetadataChangesKey];
+		for (YapCollectionKey *ck in changeset_metadataChanges)
+		{
+			if (![collectionKeys containsObject:ck])
+			{
+				block(ck, &stop);
+				if (stop) return;
+				
+				[collectionKeys addObject:ck];
+			}
+		}
+		
+		YapSet *changeset_removedKeys = [changeset objectForKey:YapDatabaseRemovedKeysKey];
+		for (YapCollectionKey *ck in changeset_removedKeys)
+		{
+			if (![collectionKeys containsObject:ck])
+			{
+				block(ck, &stop);
+				if (stop) return;
+				
+				[collectionKeys addObject:ck];
+			}
+		}
+	}
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -3461,7 +4790,7 @@
 	
 	if (!extensionsReady)
 	{
-		[registeredExtensions enumerateKeysAndObjectsUsingBlock:^(id key, id obj, BOOL *stop) {
+		[registeredExtensions enumerateKeysAndObjectsUsingBlock:^(id key, id obj, BOOL __unused *stop) {
 			
 			__unsafe_unretained NSString *extName = key;
 			__unsafe_unretained YapDatabaseExtension *ext = obj;
@@ -3498,7 +4827,8 @@
 		
 		BOOL needsClassValue = NO;
 		[self willRegisterExtension:extension
-		            withTransaction:transaction
+		                   withName:extensionName
+		                transaction:transaction
 		            needsClassValue:&needsClassValue];
 		
 		result = [extensionTransaction createIfNeeded];
@@ -3506,14 +4836,17 @@
 		if (result)
 		{
 			[self didRegisterExtension:extension
-			           withTransaction:transaction
+			                  withName:extensionName
+			               transaction:transaction
 			           needsClassValue:needsClassValue];
 			
-			[self addRegisteredExtensionConnection:extensionConnection];
-			[transaction addRegisteredExtensionTransaction:extensionTransaction];
+			[self addRegisteredExtensionConnection:extensionConnection withName:extensionName];
+			[transaction addRegisteredExtensionTransaction:extensionTransaction withName:extensionName];
 		}
 		else
 		{
+			// Registration failed.
+			
 			[transaction rollback];
 		}
 		
@@ -3524,7 +4857,7 @@
 	return result;
 }
 
-- (void)unregisterExtension:(NSString *)extensionName
+- (void)unregisterExtensionWithName:(NSString *)extensionName
 {
 	NSAssert(dispatch_get_specific(database->IsOnWriteQueueKey), @"Must go through writeQueue.");
 	
@@ -3533,55 +4866,177 @@
 		YapDatabaseReadWriteTransaction *transaction = [self newReadWriteTransaction];
 		[self preReadWriteTransaction:transaction];
 		
-		NSString *className = [transaction stringValueForKey:@"class" extension:extensionName];
-		Class class = NSClassFromString(className);
+		// Unregister the given extension
 		
-		if (className == nil)
-		{
-			YDBLogWarn(@"Unable to unregister extension(%@). Doesn't appear to be registered.", extensionName);
-		}
-		else if (class == NULL)
-		{
-			YDBLogError(@"Unable to unregister extension(%@) with unknown class(%@)", extensionName, className);
-		}
-		if (![class isSubclassOfClass:[YapDatabaseExtension class]])
-		{
-			YDBLogError(@"Unable to unregister extension(%@) with improper class(%@)", extensionName, className);
-		}
-		else
-		{
-			// Drop tables
-			[class dropTablesForRegisteredName:extensionName withTransaction:transaction];
-			
-			// Drop preferences (rows in yap2 table)
-			[transaction removeAllValuesForExtension:extensionName];
-			
-			[self didUnregisterExtension:extensionName];
-			
-			[self removeRegisteredExtensionConnection:extensionName];
-			[transaction removeRegisteredExtensionTransaction:extensionName];
-		}
+		YapDatabaseExtension *extension = [registeredExtensions objectForKey:extensionName];
 		
+		[self _unregisterExtensionWithName:extensionName transaction:transaction];
+		extension.registeredName = nil;
+		extension.registeredDatabase = nil;
+		
+		// Automatically unregister any extensions that were dependent upon this one.
+		
+		NSMutableArray *extensionNameStack = [NSMutableArray arrayWithCapacity:1];
+		[extensionNameStack addObject:extensionName];
+		
+		do
+		{
+			NSString *currentExtensionName = [extensionNameStack lastObject];
+			
+			__block NSString *dependentExtName = nil;
+			[extensionDependencies enumerateKeysAndObjectsUsingBlock:^(id key, id obj, BOOL *stop){
+				
+			//	__unsafe_unretained NSString *extName = (NSString *)key;
+				__unsafe_unretained NSSet *extDependencies = (NSSet *)obj;
+				
+				if ([extDependencies containsObject:currentExtensionName])
+				{
+					dependentExtName = (NSString *)key;
+					*stop = YES;
+				}
+			}];
+			
+			if (dependentExtName)
+			{
+				// We found an extension that was dependent upon the one we just unregistered.
+				// So we need to unregister it too.
+				
+				YapDatabaseExtension *dependentExt = [registeredExtensions objectForKey:dependentExtName];
+				
+				[self _unregisterExtensionWithName:dependentExtName transaction:transaction];
+				dependentExt.registeredName = nil;
+				
+				// And now we need to check and see if there were any extensions dependent upon this new one.
+				// So we add it to the top of the stack, and continue our search.
+				
+				[extensionNameStack addObject:dependentExtName];
+			}
+			else
+			{
+				[extensionNameStack removeLastObject];
+			}
+			
+		} while ([extensionNameStack count] > 0);
+		
+		
+		// Complete the transaction
 		[self postReadWriteTransaction:transaction];
+		
+		// And reset the registeredExtensionsChanged ivar.
+		// The above method already processed it, and included the appropriate information in the changeset.
 		registeredExtensionsChanged = NO;
 	}});
 }
 
+- (void)_unregisterExtensionWithName:(NSString *)extensionName
+                         transaction:(YapDatabaseReadWriteTransaction *)transaction
+{
+	NSString *className = nil;
+	Class extensionClass = NULL;
+    Class abstractExtClass = NSClassFromString(@"YapDatabaseExtension");
+	
+	BOOL wasPersistent;
+	
+	YapMemoryTableTransaction *memoryTableTransaction = [transaction yapMemoryTableTransaction];
+	YapCollectionKey *classKey = [[YapCollectionKey alloc] initWithCollection:extensionName key:ext_key_class];
+	
+	className = [memoryTableTransaction objectForKey:classKey];
+	if (className)
+	{
+		wasPersistent = NO;
+	}
+	else
+	{
+		className = [transaction stringValueForKey:ext_key_class extension:extensionName];
+		wasPersistent = YES;
+	}
+	
+	extensionClass = NSClassFromString(className);
+	
+	if (className == nil)
+	{
+		YDBLogWarn(@"Unable to unregister extension(%@). Doesn't appear to be registered.", extensionName);
+	}
+	else if (!extensionClass || ![extensionClass superclass])
+	{
+		YDBLogError(@"Unable to unregister extension(%@) with unknown class(%@)", extensionName, className);
+	}
+	else if (![extensionClass isSubclassOfClass:abstractExtClass])
+	{
+		YDBLogError(@"Unable to unregister extension(%@) with improper class(%@)", extensionName, className);
+	}
+	else
+	{
+		// Drop tables
+		[extensionClass dropTablesForRegisteredName:extensionName withTransaction:transaction wasPersistent:wasPersistent];
+		
+		// Drop preferences
+		if (wasPersistent)
+		{
+			// remove rows in yap2 table (where extension == extensionName)
+			[transaction removeAllValuesForExtension:extensionName];
+		}
+		else
+		{
+			// remove rows in yap memory table (where collectionKey.collection == extensionName)
+			NSMutableArray *keysToRemove = [NSMutableArray array];
+			
+			[memoryTableTransaction enumerateKeysWithBlock:^(id key, BOOL __unused *stop) {
+				
+				__unsafe_unretained YapCollectionKey *ck = (YapCollectionKey *)key;
+				if ([ck.collection isEqualToString:extensionName])
+				{
+					[keysToRemove addObject:ck];
+				}
+			}];
+			
+			[memoryTableTransaction removeObjectsForKeys:keysToRemove];
+		}
+		
+		// Remove from registeredExtensions, extensionsOrder & extensionDependencies (if needed)
+		[self didUnregisterExtensionWithName:extensionName];
+		
+		// Remove YapDatabaseExtensionConnection subclass instance (if needed)
+		[self removeRegisteredExtensionConnectionWithName:extensionName];
+		
+		// Remove YapDatabaseExtensionTransaction subclass instance (if needed)
+		[transaction removeRegisteredExtensionTransactionWithName:extensionName];
+	}
+}
+
 - (void)willRegisterExtension:(YapDatabaseExtension *)extension
-              withTransaction:(YapDatabaseReadWriteTransaction *)transaction
+                     withName:(NSString *)extensionName
+                transaction:(YapDatabaseReadWriteTransaction *)transaction
               needsClassValue:(BOOL *)needsClassValuePtr
 {
 	// This method is INTERNAL
-	//
+	
+	// Check to see if we should create the YapMemoryTable.
+	// We create this on demand the first time an extension is registered.
+	
+	if ([registeredMemoryTables objectForKey:@"yap"] == nil)
+	{
+		YapMemoryTable *memoryTable = [[YapMemoryTable alloc] initWithKeyClass:[YapCollectionKey class]];
+		
+		[self registerMemoryTable:memoryTable withName:@"yap"];
+	}
+	
+	// Special handling for non-persistent (in-memory only) extensions.
+	
+	if (![extension isPersistent])
+	{
+		// First time registration
+		*needsClassValuePtr = YES;
+		return;
+	}
+	
 	// The class name of every registered extension is recorded in the yap2 table.
 	// We ensure that re-registrations under the same name use the same extension class.
 	// If we detect a change, we auto-unregister the previous extension.
 	//
 	// Note: @"class" is a reserved key for all extensions.
 	
-	NSString *extensionName = extension.registeredName;
-	
-	NSString *prevExtensionClassName = [transaction stringValueForKey:@"class" extension:extensionName];
+	NSString *prevExtensionClassName = [transaction stringValueForKey:ext_key_class extension:extensionName];
 	if (prevExtensionClassName == nil)
 	{
 		// First time registration
@@ -3611,6 +5066,7 @@
 	YDBLogWarn(@"Dropping tables for previously registered extension with name(%@), class(%@) for new class(%@)",
 	           extensionName, prevExtensionClassName, extensionClassName);
 	
+	Class abstractExtClass = NSClassFromString(@"YapDatabaseExtension");
 	Class prevExtensionClass = NSClassFromString(prevExtensionClassName);
 	
 	if (prevExtensionClass == NULL)
@@ -3618,7 +5074,7 @@
 		YDBLogError(@"Unable to drop tables for previously registered extension with name(%@), unknown class(%@)",
 		            extensionName, prevExtensionClassName);
 	}
-	else if (![prevExtensionClass isSubclassOfClass:[YapDatabaseExtension class]])
+	else if (![prevExtensionClass isSubclassOfClass:abstractExtClass])
 	{
 		YDBLogError(@"Unable to drop tables for previously registered extension with name(%@), invalid class(%@)",
 		            extensionName, prevExtensionClassName);
@@ -3626,7 +5082,7 @@
 	else
 	{
 		// Drop tables
-		[prevExtensionClass dropTablesForRegisteredName:extensionName withTransaction:transaction];
+		[prevExtensionClass dropTablesForRegisteredName:extensionName withTransaction:transaction wasPersistent:YES];
 		
 		// Drop preferences (rows in yap2 table)
 		[transaction removeAllValuesForExtension:extensionName];
@@ -3636,20 +5092,27 @@
 }
 
 - (void)didRegisterExtension:(YapDatabaseExtension *)extension
-             withTransaction:(YapDatabaseReadWriteTransaction *)transaction
+                    withName:(NSString *)extensionName
+                 transaction:(YapDatabaseReadWriteTransaction *)transaction
              needsClassValue:(BOOL)needsClassValue
 {
 	// This method is INTERNAL
 	
-	NSString *extensionName = extension.registeredName;
-	
-	// Record the class name of the extension in the yap2 table.
+	// Record the class name of the extension in the yap2 table (if needed)
 	
 	if (needsClassValue)
 	{
 		NSString *extensionClassName = NSStringFromClass([extension class]);
 		
-		[transaction setStringValue:extensionClassName forKey:@"class" extension:extensionName];
+		if ([extension isPersistent])
+		{
+			[transaction setStringValue:extensionClassName forKey:ext_key_class extension:extensionName];
+		}
+		else
+		{
+			YapCollectionKey *classKey = [[YapCollectionKey alloc] initWithCollection:extensionName key:ext_key_class];
+			[[transaction yapMemoryTableTransaction] setObject:extensionClassName forKey:classKey];
+		}
 	}
 	
 	// Update the list of registered extensions.
@@ -3657,13 +5120,19 @@
 	NSMutableDictionary *newRegisteredExtensions = [registeredExtensions mutableCopy];
 	[newRegisteredExtensions setObject:extension forKey:extensionName];
 	
-	NSMutableArray *newExtensionsOrder = [extensionsOrder mutableCopy];
-	[newExtensionsOrder addObject:extensionName];
-	
 	registeredExtensions = [newRegisteredExtensions copy];
-	extensionsOrder = [newExtensionsOrder copy];
-	extensionsReady = NO;
+	extensionsOrder = [extensionsOrder arrayByAddingObject:extensionName];
 	
+	NSSet *dependencies = [extension dependencies];
+	if (dependencies == nil)
+		dependencies = [NSSet set];
+	
+	NSMutableDictionary *newExtensionDependencies = [extensionDependencies mutableCopy];
+	[newExtensionDependencies setObject:dependencies forKey:extensionName];
+	
+	extensionDependencies = [newExtensionDependencies copy];
+	
+	extensionsReady = NO;
 	sharedKeySetForExtensions = [NSDictionary sharedKeySetForKeys:[registeredExtensions allKeys]];
 	
 	// Set the registeredExtensionsChanged flag.
@@ -3674,7 +5143,7 @@
 	registeredExtensionsChanged = YES;
 }
 
-- (void)didUnregisterExtension:(NSString *)extensionName
+- (void)didUnregisterExtensionWithName:(NSString *)extensionName
 {
 	// This method is INTERNAL
 	
@@ -3684,8 +5153,18 @@
 		[newRegisteredExtensions removeObjectForKey:extensionName];
 		
 		registeredExtensions = [newRegisteredExtensions copy];
-		extensionsReady = NO;
 		
+		NSMutableArray *newExtensionsOrder = [extensionsOrder mutableCopy];
+		[newExtensionsOrder removeObject:extensionName];
+		
+		extensionsOrder = [newExtensionsOrder copy];
+		
+		NSMutableDictionary *newExtensionDependencies = [extensionDependencies mutableCopy];
+		[newExtensionDependencies removeObjectForKey:extensionName];
+		
+		extensionDependencies = [newExtensionDependencies copy];
+		
+		extensionsReady = NO;
 		sharedKeySetForExtensions = [NSDictionary sharedKeySetForKeys:[registeredExtensions allKeys]];
 		
 		// Set the registeredExtensionsChanged flag.
@@ -3697,19 +5176,17 @@
 	}
 }
 
-- (void)addRegisteredExtensionConnection:(YapDatabaseExtensionConnection *)extConnection
+- (void)addRegisteredExtensionConnection:(YapDatabaseExtensionConnection *)extConnection withName:(NSString *)extName
 {
 	// This method is INTERNAL
 	
 	if (extensions == nil)
 		extensions = [[NSMutableDictionary alloc] init];
 	
-	NSString *extName = [[extConnection extension] registeredName];
-	
 	[extensions setObject:extConnection forKey:extName];
 }
 
-- (void)removeRegisteredExtensionConnection:(NSString *)extName
+- (void)removeRegisteredExtensionConnectionWithName:(NSString *)extName
 {
 	// This method is INTERNAL
 	
@@ -3717,141 +5194,704 @@
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+#pragma mark Pragma
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+/**
+ * Returns the current synchronous configuration via "PRAGMA synchronous;".
+ * Allows you to verify that sqlite accepted your synchronous configuration request.
+**/
+- (NSString *)pragmaSynchronous
+{
+	__block int64_t value = -1;
+	
+	dispatch_block_t block = ^{ @autoreleasepool {
+		
+		value = [YapDatabase pragma:@"synchronous" using:db];
+	}};
+	
+	if (dispatch_get_specific(IsOnConnectionQueueKey))
+		block();
+	else
+		dispatch_sync(connectionQueue, block);
+	
+	return [YapDatabase pragmaValueForSynchronous:value];
+}
+
+/**
+ * Returns the current page_size configuration via "PRAGMA page_size;".
+ * Allows you to verify that sqlite accepted your page_size configuration request.
+**/
+- (NSInteger)pragmaPageSize
+{
+	__block int64_t value = -1;
+	
+	dispatch_block_t block = ^{ @autoreleasepool {
+		
+		value = [YapDatabase pragma:@"page_size" using:db];
+	}};
+	
+	if (dispatch_get_specific(IsOnConnectionQueueKey))
+		block();
+	else
+		dispatch_sync(connectionQueue, block);
+	
+	return (NSInteger)value;
+}
+
+/**
+ * Returns the currently memory mapped I/O configureation via "PRAGMA mmap_size;".
+ * Allows you to verify that sqlite accepted your mmap_size configuration request.
+ *
+ * Memory mapping may be disabled by sqlite's compile-time options.
+ * Or it may restrict the mmap_size to something smaller than requested.
+**/
+- (NSInteger)pragmaMMapSize
+{
+	__block int64_t value = -1;
+	
+	dispatch_block_t block = ^{ @autoreleasepool {
+		
+		value = [YapDatabase pragma:@"mmap_size" using:db];
+	}};
+	
+	if (dispatch_get_specific(IsOnConnectionQueueKey))
+		block();
+	else
+		dispatch_sync(connectionQueue, block);
+	
+	return (NSInteger)value;
+}
+
+/**
+ * Upgrade Notice:
+ *
+ * The "auto_vacuum=FULL" was not properly set until YapDatabase v2.5.
+ * And thus if you have an app that was using YapDatabase prior to this version,
+ * then the existing database file will continue to operate in "auto_vacuum=NONE" mode.
+ * This means the existing database file won't be properly truncated as you delete information from the db.
+ * That is, the data will be removed, but the pages will be moved to the freelist,
+ * and the file itself will remain the same size on disk. (I.e. the file size can grow, but not shrink.)
+ * To correct this problem, you should run the vacuum operation is at least once.
+ * After it is run, the "auto_vacuum=FULL" mode will be set,
+ * and the database file size will automatically shrink in the future (as you delete data).
+ *
+ * @returns Result from "PRAGMA auto_vacuum;" command, as a readable string:
+ *   - NONE
+ *   - FULL
+ *   - INCREMENTAL
+ *   - UNKNOWN (future proofing)
+ *
+ * If the return value is NONE, then you should run the vacuum operation at some point
+ * in order to properly reconfigure the database.
+ *
+ * Concerning Method Invocation:
+ *
+ * You can invoke this method as a standalone method on the connection:
+ *
+ *   NSString *value = [databaseConnection pragmaAutoVacuum]
+ *
+ * Or you can invoke this method within a transaction:
+ *
+ * [databaseConnection asyncReadWithBlock:^(YapDatabaseReadTransaction *transaction){
+ *     NSString *value = [databaseConnection pragmaAutoVacuum];
+ * }];
+**/
+- (NSString *)pragmaAutoVacuum
+{
+	__block int64_t value = -1;
+	
+	dispatch_block_t block = ^{ @autoreleasepool {
+	
+		value = [YapDatabase pragma:@"auto_vacuum" using:db];
+	}};
+	
+	if (dispatch_get_specific(IsOnConnectionQueueKey))
+		block();
+	else
+		dispatch_sync(connectionQueue, block);
+	
+	return [YapDatabase pragmaValueForAutoVacuum:value];
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+#pragma mark Vacuum
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+/**
+ * Performs a VACUUM on the sqlite database.
+ *
+ * This method operates as a synchronous ReadWrite "transaction".
+ * That is, it behaves in a similar fashion, and you may treat it as if it is a ReadWrite transaction.
+ *
+ * For more infomation on the VACUUM operation, see the sqlite docs:
+ * http://sqlite.org/lang_vacuum.html
+ *
+ * Remember that YapDatabase operates in WAL mode, with "auto_vacuum=FULL" set.
+ *
+ * @see pragmaAutoVacuum
+**/
+- (void)vacuum
+{
+	dispatch_sync(connectionQueue, ^{ @autoreleasepool {
+		
+		if (longLivedReadTransaction)
+		{
+			if (throwExceptionsForImplicitlyEndingLongLivedReadTransaction)
+			{
+				@throw [self implicitlyEndingLongLivedReadTransactionException];
+			}
+			else
+			{
+				YDBLogWarn(@"Implicitly ending long-lived read transaction on connection %@, database %@",
+						   self, database);
+				
+				[self endLongLivedReadTransaction];
+			}
+		}
+		
+		__preWriteQueue(self);
+		dispatch_sync(database->writeQueue, ^{ @autoreleasepool {
+			
+			[self prePseudoReadWriteTransaction];
+			
+			int status;
+			
+			status = sqlite3_exec(db, "PRAGMA auto_vacuum = FULL;", NULL, NULL, NULL);
+			if (status != SQLITE_OK)
+			{
+				YDBLogError(@"Error setting PRAGMA auto_vacuum: %d %s", status, sqlite3_errmsg(db));
+			}
+			
+			YDBLogVerbose(@"Starting VACUUM ...");
+			
+			status = sqlite3_exec(db, "VACUUM;", NULL, NULL, NULL);
+			if (status != SQLITE_OK)
+			{
+				YDBLogError(@"Error performing VACUUM: %d %s", status, sqlite3_errmsg(db));
+			}
+			
+			YDBLogVerbose(@"VACUUM complete !");
+			
+			hasDiskChanges = YES;
+			[self postPseudoReadWriteTransaction];
+			
+		}}); // End dispatch_sync(database->writeQueue)
+		__postWriteQueue(self);
+	}});     // End dispatch_sync(connectionQueue)
+}
+
+/**
+ * Performs a VACUUM on the sqlite database.
+ *
+ * This method operates as an asynchronous readWrite "transaction".
+ * That is, it behaves in a similar fashion, and you may treat it as if it is a ReadWrite transaction.
+ *
+ * For more infomation on the VACUUM operation, see the sqlite docs:
+ * http://sqlite.org/lang_vacuum.html
+ *
+ * Remember that YapDatabase operates in WAL mode, with "auto_vacuum=FULL" set.
+ *
+ * An optional completion block may be used.
+ * The completionBlock will be invoked on the main thread (dispatch_get_main_queue()).
+ *
+ * @see pragmaAutoVacuum
+**/
+- (void)asyncVacuumWithCompletionBlock:(dispatch_block_t)completionBlock
+{
+	[self asyncVacuumWithCompletionQueue:NULL completionBlock:completionBlock];
+}
+
+/**
+ * Performs a VACUUM on the sqlite database.
+ *
+ * This method operates as an asynchronous readWrite "transaction".
+ * That is, it behaves in a similar fashion, and you may treat it as if it is a ReadWrite transaction.
+ *
+ * For more infomation on the VACUUM operation, see the sqlite docs:
+ * http://sqlite.org/lang_vacuum.html
+ *
+ * Remember that YapDatabase operates in WAL mode, with "auto_vacuum=FULL" set.
+ *
+ * An optional completion block may be used.
+ * Additionally the dispatch_queue to invoke the completion block may also be specified.
+ * If NULL, dispatch_get_main_queue() is automatically used.
+ * 
+ * @see pragmaAutoVacuum
+**/
+- (void)asyncVacuumWithCompletionQueue:(dispatch_queue_t)completionQueue
+                       completionBlock:(dispatch_block_t)completionBlock
+{
+	if (completionQueue == NULL && completionBlock != NULL)
+		completionQueue = dispatch_get_main_queue();
+	
+	dispatch_async(connectionQueue, ^{ @autoreleasepool {
+		
+		if (longLivedReadTransaction)
+		{
+			if (throwExceptionsForImplicitlyEndingLongLivedReadTransaction)
+			{
+				@throw [self implicitlyEndingLongLivedReadTransactionException];
+			}
+			else
+			{
+				YDBLogWarn(@"Implicitly ending long-lived read transaction on connection %@, database %@",
+						   self, database);
+				
+				[self endLongLivedReadTransaction];
+			}
+		}
+		
+		__preWriteQueue(self);
+		dispatch_sync(database->writeQueue, ^{ @autoreleasepool {
+			
+			[self prePseudoReadWriteTransaction];
+			
+			int status;
+			
+			status = sqlite3_exec(db, "PRAGMA auto_vacuum = FULL;", NULL, NULL, NULL);
+			if (status != SQLITE_OK)
+			{
+				YDBLogError(@"Error setting PRAGMA auto_vacuum: %d %s", status, sqlite3_errmsg(db));
+			}
+			
+			YDBLogVerbose(@"Starting VACUUM ...");
+			
+			status = sqlite3_exec(db, "VACUUM;", NULL, NULL, NULL);
+			if (status != SQLITE_OK)
+			{
+				YDBLogError(@"Error performing VACUUM: %d %s", status, sqlite3_errmsg(db));
+			}
+			
+			YDBLogVerbose(@"VACUUM complete !");
+			
+			hasDiskChanges = YES;
+			[self postPseudoReadWriteTransaction];
+			
+			if (completionBlock) {
+				dispatch_async(completionQueue, completionBlock);
+			}
+			
+		}}); // End dispatch_sync(database->writeQueue)
+		__postWriteQueue(self);
+	}});     // End dispatch_async(connectionQueue)
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+#pragma mark Backup
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+/**
+ * This method backs up the database by exporting all the tables to another sqlite database.
+ *
+ * This method operates as a synchronous ReadWrite "transaction".
+ * That is, it behaves in a similar fashion, and you may treat it as if it is a ReadWrite transaction.
+ *
+ * The database will be backed up as it exists at the moment this transaction operates.
+ * That is, it will backup everything in the sqlite file, as well as everything in the WAL file.
+ *
+ * For more information on the BACKUP operation, see the sqlite docs:
+ * https://www.sqlite.org/c3ref/backup_finish.html
+ *
+ * As stated in the sqlite docs, it is your responsibilty to ensure that nothing else is
+ * currently using the backupDatabase.
+**/
+- (NSError *)backupToPath:(NSString *)backupDatabasePath
+{
+	__block NSError *error = nil;
+	
+	dispatch_sync(connectionQueue, ^{ @autoreleasepool {
+		
+		if (longLivedReadTransaction)
+		{
+			if (throwExceptionsForImplicitlyEndingLongLivedReadTransaction)
+			{
+				@throw [self implicitlyEndingLongLivedReadTransactionException];
+			}
+			else
+			{
+				YDBLogWarn(@"Implicitly ending long-lived read transaction on connection %@, database %@",
+						   self, database);
+				
+				[self endLongLivedReadTransaction];
+			}
+		}
+		
+		__preWriteQueue(self);
+		dispatch_sync(database->writeQueue, ^{ @autoreleasepool {
+			
+			[self prePseudoReadWriteTransaction];
+			
+			error = [self _backupToPath:backupDatabasePath withStep:1500 progress:nil];
+			
+			hasDiskChanges = NO; // backup does NOT make actually make changes
+			[self postPseudoReadWriteTransaction];
+			
+		}}); // End dispatch_sync(database->writeQueue)
+		__postWriteQueue(self);
+	}});     // End dispatch_sync(connectionQueue)
+	
+	return error;
+}
+
+/**
+ * This method backs up the database by exporting all the tables to another sqlite database.
+ *
+ * This method operates as an asynchronous readWrite "transaction".
+ * That is, it behaves in a similar fashion, and you may treat it as if it is a ReadWrite transaction.
+ * 
+ * The database will be backed up as it exists at the moment this transaction operates.
+ * That is, it will backup everything in the sqlite file, as well as everything in the WAL file.
+ * 
+ * An optional completion block may be used.
+ * The completionBlock will be invoked on the main thread (dispatch_get_main_queue()).
+ *
+ * For more information on the BACKUP operation, see the sqlite docs:
+ * https://www.sqlite.org/c3ref/backup_finish.html
+ *
+ * As stated in the sqlite docs, it is your responsibilty to ensure that nothing else is
+ * currently using the backupDatabase.
+ *
+ * @return
+ *   A NSProgress instance that may be used to track the backup progress.
+ *   The progress in cancellable, meaning that invoking [progress cancel] will abort the backup operation.
+**/
+- (NSProgress *)asyncBackupToPath:(NSString *)backupDatabasePath
+                  completionBlock:(nullable void (^)(NSError *error))completionBlock
+{
+	return [self asyncBackupToPath:backupDatabasePath completionQueue:NULL completionBlock:completionBlock];
+}
+
+/**
+ * This method backs up the database by exporting all the tables to another sqlite database.
+ *
+ * This method operates as an asynchronous readWrite "transaction".
+ * That is, it behaves in a similar fashion, and you may treat it as if it is a ReadWrite transaction.
+ *
+ * The database will be backed up as it exists at the moment this transaction operates.
+ * That is, it will backup everything in the sqlite file, as well as everything in the WAL file.
+ *
+ * An optional completion block may be used.
+ * Additionally the dispatch_queue to invoke the completion block may also be specified.
+ * If NULL, dispatch_get_main_queue() is automatically used.
+ *
+ * For more information on the BACKUP operation, see the sqlite docs:
+ * https://www.sqlite.org/c3ref/backup_finish.html
+ *
+ * As stated in the sqlite docs, it is your responsibilty to ensure that nothing else is
+ * currently using the backupDatabase.
+ *
+ * @return
+ *   A NSProgress instance that may be used to track the backup progress.
+ *   The progress in cancellable, meaning that invoking [progress cancel] will abort the backup operation.
+**/
+- (NSProgress *)asyncBackupToPath:(NSString *)backupDatabasePath
+                  completionQueue:(nullable dispatch_queue_t)completionQueue
+                  completionBlock:(nullable void (^)(NSError *))completionBlock
+{
+	if (completionQueue == NULL && completionBlock != NULL)
+		completionQueue = dispatch_get_main_queue();
+	
+	NSProgress *progress = [NSProgress progressWithTotalUnitCount:0];
+	
+	dispatch_async(connectionQueue, ^{ @autoreleasepool {
+		
+		if (longLivedReadTransaction)
+		{
+			if (throwExceptionsForImplicitlyEndingLongLivedReadTransaction)
+			{
+				@throw [self implicitlyEndingLongLivedReadTransactionException];
+			}
+			else
+			{
+				YDBLogWarn(@"Implicitly ending long-lived read transaction on connection %@, database %@",
+						   self, database);
+				
+				[self endLongLivedReadTransaction];
+			}
+		}
+		
+		__preWriteQueue(self);
+		dispatch_sync(database->writeQueue, ^{ @autoreleasepool {
+			
+			[self prePseudoReadWriteTransaction];
+			
+			NSError *error = [self _backupToPath:backupDatabasePath withStep:1500 progress:progress];
+			
+			hasDiskChanges = NO; // backup does NOT make actually make changes
+			[self postPseudoReadWriteTransaction];
+			
+			if (completionBlock)
+			{
+				dispatch_async(completionQueue, ^{ @autoreleasepool {
+					completionBlock(error);
+				}});
+			}
+			
+		}}); // End dispatch_sync(database->writeQueue)
+		__postWriteQueue(self);
+	}});     // End dispatch_async(connectionQueue)
+	
+	return progress;
+}
+
+- (NSError *)_backupToPath:(NSString *)backupDatabasePath withStep:(int)nPages progress:(NSProgress *)progress
+{
+	// First try to open the backup database (using the given path).
+	
+	sqlite3 *backup_db;
+	
+	int flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_NOMUTEX | SQLITE_OPEN_PRIVATECACHE;
+	
+	int status = sqlite3_open_v2([backupDatabasePath UTF8String], &backup_db, flags, NULL);
+	if (status != SQLITE_OK)
+	{
+		NSError *sqliteError = nil;
+		
+		// Sometimes the open function returns a db to allow us to query it for the error message
+		if (backup_db) {
+			sqliteError = [self sqliteErrorWithCode:status message:sqlite3_errmsg(backup_db)];
+		}
+		else {
+			sqliteError = [self sqliteErrorWithCode:status message:NULL];
+		}
+		
+		if (backup_db)
+		{
+			sqlite3_close(backup_db);
+			backup_db = NULL;
+		}
+		
+		return [self ydbErrorWithDescription:@"Error from: sqlite3_open_v2()" sqliteError:sqliteError];
+	}
+	
+	// Initialize backup instance
+	
+	sqlite3_backup *backup = sqlite3_backup_init(backup_db, "main", db, "main");
+	if (backup == NULL)
+	{
+		// From the docs:
+		//
+		// If an error occurs within sqlite3_backup_init(D,N,S,M), then NULL is returned and an error code
+		// and error message are stored in the destination database connection D. The error code and message for
+		// the failed call to sqlite3_backup_init() can be retrieved using the sqlite3_errcode(), sqlite3_errmsg().
+		
+		NSError *sqliteError = [self sqliteErrorWithCode:sqlite3_errcode(backup_db)
+												 message:sqlite3_errmsg(backup_db)];
+		
+		return [self ydbErrorWithDescription:@"Error from: sqlite3_backup_init()" sqliteError:sqliteError];
+	}
+	
+	// Loop through the backup process
+	
+	BOOL cancelled = progress.cancelled;
+	if (!cancelled)
+	{
+		while ((status = sqlite3_backup_step(backup, nPages)) == SQLITE_OK)
+		{
+			if (progress)
+			{
+				int pagecount = sqlite3_backup_pagecount(backup);
+				int remaining = sqlite3_backup_remaining(backup);
+				
+				progress.totalUnitCount = pagecount;
+				progress.completedUnitCount = (pagecount - remaining);
+				
+				cancelled = progress.cancelled;
+				if (cancelled) break;
+			}
+		}
+	}
+	
+	NSError *error = nil;
+	
+	if (cancelled)
+	{
+		error = [self ydbErrorWithDescription:@"Operation cancelled" sqliteError:nil];
+	}
+	else
+	{
+		if (status == SQLITE_DONE)
+		{
+			if (progress)
+			{
+				int pagecount = sqlite3_backup_pagecount(backup);
+				int remaining = sqlite3_backup_remaining(backup);
+				
+				progress.totalUnitCount = pagecount;
+				progress.completedUnitCount = (pagecount - remaining);
+			}
+		}
+		else // if (status != SQLITE_DONE)
+		{
+			NSError *sqliteError = [self sqliteErrorWithCode:status message:sqlite3_errstr(status)];
+			
+			error = [self ydbErrorWithDescription:@"Error from: sqlite3_backup_step()" sqliteError:sqliteError];
+		}
+	}
+	
+	sqlite3_backup_finish(backup);
+	sqlite3_close(backup_db);
+	
+	return error;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 #pragma mark Memory Tables
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-- (NSDictionary *)registeredTables
+- (NSDictionary *)registeredMemoryTables
 {
 	// This method is INTERNAL
 	
-	return registeredTables;
+	return registeredMemoryTables;
 }
 
-- (BOOL)registerTable:(YapMemoryTable *)table withName:(NSString *)name
+- (BOOL)registerMemoryTable:(YapMemoryTable *)table withName:(NSString *)name
 {
 	// This method is INTERNAL
 	
-	if ([registeredTables objectForKey:name])
+	if ([registeredMemoryTables objectForKey:name])
 		return NO;
 	
-	NSMutableDictionary *newRegisteredTables = [registeredTables mutableCopy];
-	[newRegisteredTables setObject:table forKey:name];
+	NSMutableDictionary *newRegisteredMemoryTables = [registeredMemoryTables mutableCopy];
+	[newRegisteredMemoryTables setObject:table forKey:name];
 	
-	registeredTables = [newRegisteredTables copy];
-	registeredTablesChanged = YES;
+	registeredMemoryTables = [newRegisteredMemoryTables copy];
+	registeredMemoryTablesChanged = YES;
 	
 	return YES;
 }
 
-- (void)unregisterTableWithName:(NSString *)name
+- (void)unregisterMemoryTableWithName:(NSString *)name
 {
 	// This method is INTERNAL
 	
-	if ([registeredTables objectForKey:name])
+	if ([registeredMemoryTables objectForKey:name])
 	{
-		NSMutableDictionary *newRegisteredTables = [registeredTables mutableCopy];
-		[newRegisteredTables removeObjectForKey:name];
+		NSMutableDictionary *newRegisteredMemoryTables = [registeredMemoryTables mutableCopy];
+		[newRegisteredMemoryTables removeObjectForKey:name];
 		
-		registeredTables = [newRegisteredTables copy];
-		registeredTablesChanged = YES;
+		registeredMemoryTables = [newRegisteredMemoryTables copy];
+		registeredMemoryTablesChanged = YES;
 	}
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-#pragma mark Utilities
+#pragma mark Errors
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-/**
- * Long-lived read transactions are a great way to achive stability, especially in places like the main-thread.
- * However, they pose a unique problem. These long-lived transactions often start out by
- * locking the WAL (write ahead log). This prevents the WAL from ever getting reset,
- * and thus causes the WAL to potentially grow infinitely large. In order to allow the WAL to get properly reset,
- * we need the long-lived read transactions to "reset". That is, without changing their stable state (their snapshot),
- * we need them to restart the transaction, but this time without locking this WAL.
- * 
- * We use the maybeResetLongLivedReadTransaction method to achieve this.
-**/
-- (void)maybeResetLongLivedReadTransaction
+					 
+- (NSError *)sqliteErrorWithCode:(int)status message:(const char *)message
 {
-	// Async dispatch onto the writeQueue so we know there aren't any other active readWrite transactions
-	
-	dispatch_async(database->writeQueue, ^{
-		
-		// Pause the writeQueue so readWrite operations can't interfere with us.
-		// We abort if our connection has a readWrite transaction pending.
-		
-		BOOL abort = NO;
-		
-		OSSpinLockLock(&lock);
+	NSDictionary *userInfo = nil;
+	if (message)
+	{
+		NSString *errMsg = [NSString stringWithUTF8String:message];
+		if (errMsg)
 		{
-			if (activeReadWriteTransaction) {
-				abort = YES;
-			}
-			else if (!writeQueueSuspended) {
-				dispatch_suspend(database->writeQueue);
-				writeQueueSuspended = YES;
-			}
+			userInfo = @{ NSLocalizedDescriptionKey : errMsg };
 		}
-		OSSpinLockUnlock(&lock);
-		
-		if (abort) return;
-		
-		// Async dispatch onto our connectionQueue.
-		
-		dispatch_async(connectionQueue, ^{
-			
-			// If possible, silently reset the longLivedReadTransaction (same snapshot, no longer locking the WAL)
-			
-			if (longLivedReadTransaction && (snapshot == [database snapshot]))
-			{
-				NSArray *empty = [self beginLongLivedReadTransaction];
-				
-				if ([empty count] != 0)
-				{
-					YDBLogError(@"Core logic failure! "
-					            @"Silent longLivedReadTransaction reset resulted in non-empty notification array!");
-				}
-			}
-			
-			// Resume the writeQueue
-			
-			OSSpinLockLock(&lock);
-			{
-				if (writeQueueSuspended) {
-					dispatch_resume(database->writeQueue);
-					writeQueueSuspended = NO;
-				}
-			}
-			OSSpinLockUnlock(&lock);
-		});
-	});
+	}
+	
+	return [NSError errorWithDomain:@"SQLite" code:status userInfo:userInfo];
 }
 
-NS_INLINE void __preWriteQueue(YapDatabaseConnection *connection)
+- (NSError *)ydbErrorWithDescription:(NSString *)description sqliteError:(NSError *)underlyingError
 {
-	OSSpinLockLock(&connection->lock);
-	{
-		if (connection->writeQueueSuspended) {
-			dispatch_resume(connection->database->writeQueue);
-			connection->writeQueueSuspended = NO;
-		}
-		connection->activeReadWriteTransaction = YES;
+	NSMutableDictionary *userInfo = [NSMutableDictionary dictionaryWithCapacity:2];
+	if (description) {
+		userInfo[NSLocalizedDescriptionKey] = description;
 	}
-	OSSpinLockUnlock(&connection->lock);
-}
-
-NS_INLINE void __postWriteQueue(YapDatabaseConnection *connection)
-{
-	OSSpinLockLock(&connection->lock);
-	{
-		connection->activeReadWriteTransaction = NO;
+	if (underlyingError) {
+		userInfo[NSUnderlyingErrorKey] = underlyingError;
 	}
-	OSSpinLockUnlock(&connection->lock);
+	
+	return [NSError errorWithDomain:@"YapDatabase" code:0 userInfo:userInfo];
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 #pragma mark Exceptions
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+- (NSException *)nonMainThreadException
+{
+	NSString *connectionName = self.name;
+	NSString *nameInfo = ([connectionName length] > 0) ? [NSString stringWithFormat:@" <%@>", connectionName] : @"";
+	
+	NSString *reason = [NSString stringWithFormat:
+	    @"YapDatabaseConnection[%p]%@ - unpermitted attempt to execute transaction on nom-main thread",
+	    self, nameInfo];
+	
+	NSDictionary *userInfo = @{ NSLocalizedRecoverySuggestionErrorKey:
+		@"This connection was configured (via the permittedTransactions property) to only allow transactions"
+		@" to be executed from the main-thread. Presumably this connection is dedicated to UI tasks, and thus"
+		@" its use on background threads is being discouraged in order to guarantee the connection never blocks."
+		@" Perhaps you're using the wrong dedicated connection."
+		@" Or you need to create a temporary connection via [database newConnection]."};
+	
+	return [NSException exceptionWithName:@"YapDatabaseException" reason:reason userInfo:userInfo];
+}
+
+#if YapDatabaseEnforcePermittedTransactions
+- (NSException *)unpermittedTransactionException:(NSUInteger)transactionFlag
+{
+	NSUInteger flags = self.permittedTransactions;
+	
+	NSString *connectionName = self.name;
+	NSString *nameInfo = ([connectionName length] > 0) ? [NSString stringWithFormat:@" <%@>", connectionName] : @"";
+	
+	NSString *unpermittedTransaction = @"unknownTransaction";
+	if (transactionFlag == YDB_SyncReadTransaction)
+		unpermittedTransaction = @"(sync)readTransaction";
+	if (transactionFlag == YDB_AsyncReadTransaction)
+		unpermittedTransaction = @"asyncReadTransaction";
+	if (transactionFlag == YDB_SyncReadWriteTransaction)
+		unpermittedTransaction = @"(sync)readWriteTransaction";
+	if (transactionFlag == YDB_AsyncReadWriteTransaction)
+		unpermittedTransaction = @"asyncReadWriteTransaction";
+	
+	NSString *reason = [NSString stringWithFormat:
+	    @"YapDatabaseConnection[%p]%@ - unpermitted attempt to execute %@", self, nameInfo, unpermittedTransaction];
+	
+	NSMutableArray *permittedComponents = [NSMutableArray arrayWithCapacity:4];
+	if (flags & YDB_SyncReadTransaction)
+		[permittedComponents addObject:@"(sync)readTransaction"];
+	if (flags & YDB_AsyncReadTransaction)
+		[permittedComponents addObject:@"asyncReadTransaction"];
+	if (flags & YDB_SyncReadWriteTransaction)
+		[permittedComponents addObject:@"(sync)readWriteTransaction"];
+	if (flags & YDB_AsyncReadWriteTransaction)
+		[permittedComponents addObject:@"asyncReadWriteTransaction"];
+	
+	NSString *suggestion = [NSString stringWithFormat:
+	    @"This connection was configured (via the permittedTransactions property) to only allow"
+	    @" certain types of transactions. The permittedTransactions are: %@",
+	    [permittedComponents componentsJoinedByString:@", "]];
+	
+	NSDictionary *userInfo = @{ NSLocalizedRecoverySuggestionErrorKey: suggestion };
+	
+	return [NSException exceptionWithName:@"YapDatabaseException" reason:reason userInfo:userInfo];
+}
+#endif
+
+#ifndef NS_BLOCK_ASSERTIONS
+- (NSException *)deadlockDetectionException
+{
+	NSString *connectionName = self.name;
+	NSString *nameInfo = ([connectionName length] > 0) ? [NSString stringWithFormat:@" <%@>", connectionName] : @"";
+	
+	NSString *reason = [NSString stringWithFormat:
+	    @"YapDatabaseConnection[%p]%@ - deadlock detection",
+	    self, nameInfo];
+	
+	NSDictionary *userInfo = @{ NSLocalizedRecoverySuggestionErrorKey:
+		@"You are attempting to execute a transaction within a transaction. This will result in deadlock."
+		@" For more information, see the \"Thread Safety\" wiki page:"
+		@" https://github.com/yapstudios/YapDatabase/wiki/Thread-Safety#connections-queues--deadlock"};
+	
+	return [NSException exceptionWithName:@"YapDatabaseException" reason:reason userInfo:userInfo];
+}
+#endif
 
 - (NSException *)implicitlyEndingLongLivedReadTransactionException
 {

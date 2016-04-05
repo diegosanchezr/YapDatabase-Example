@@ -1,17 +1,21 @@
 #import <Foundation/Foundation.h>
+#import "YapCollectionKey.h"
 
 @class YapDatabase;
 @class YapDatabaseReadTransaction;
 @class YapDatabaseReadWriteTransaction;
+@class YapDatabaseExtensionConnection;
+
+NS_ASSUME_NONNULL_BEGIN
 
 /**
  * Welcome to YapDatabase!
  *
  * The project page has a wealth of documentation if you have any questions.
- * https://github.com/yaptv/YapDatabase
+ * https://github.com/yapstudios/YapDatabase
  *
  * If you're new to the project you may want to visit the wiki.
- * https://github.com/yaptv/YapDatabase/wiki
+ * https://github.com/yapstudios/YapDatabase/wiki
  *
  * From a single YapDatabase instance you can create multiple connections.
  * Each connection is thread-safe and may be used concurrently with other connections.
@@ -29,18 +33,50 @@
  * But for conncurrent access between multiple threads you must use multiple connections.
 **/
 
-typedef enum  {
-	YapDatabaseConnectionFlushMemoryLevelNone     = 0,
-	YapDatabaseConnectionFlushMemoryLevelMild     = 1,
-	YapDatabaseConnectionFlushMemoryLevelModerate = 2,
-	YapDatabaseConnectionFlushMemoryLevelFull     = 3,
-} YapDatabaseConnectionFlushMemoryLevel;
-
-typedef enum {
+typedef NS_ENUM(NSInteger, YapDatabasePolicy) {
 	YapDatabasePolicyContainment = 0,
 	YapDatabasePolicyShare       = 1,
 	YapDatabasePolicyCopy        = 2,
-} YapDatabasePolicy;
+};
+
+#ifndef YapDatabaseEnforcePermittedTransactions
+  #if DEBUG
+    #define YapDatabaseEnforcePermittedTransactions 1
+  #else
+    #define YapDatabaseEnforcePermittedTransactions 0
+  #endif
+#endif
+#if YapDatabaseEnforcePermittedTransactions
+typedef NS_OPTIONS(NSUInteger, YapDatabasePermittedTransactions) {
+	
+	YDB_SyncReadTransaction       = 1 << 0,                                                         // 000001
+	YDB_AsyncReadTransaction      = 1 << 1,                                                         // 000010
+	
+	YDB_SyncReadWriteTransaction  = 1 << 2,                                                         // 000100
+	YDB_AsyncReadWriteTransaction = 1 << 3,                                                         // 001000
+	
+	YDB_AnyReadTransaction        = (YDB_SyncReadTransaction | YDB_AsyncReadTransaction),           // 000011
+	YDB_AnyReadWriteTransaction   = (YDB_SyncReadWriteTransaction | YDB_AsyncReadWriteTransaction), // 001100
+	
+	YDB_AnySyncTransaction        = (YDB_SyncReadTransaction | YDB_SyncReadWriteTransaction),       // 000101
+	YDB_AnyAsyncTransaction       = (YDB_AsyncReadTransaction | YDB_AsyncReadWriteTransaction),     // 001010
+	
+	YDB_AnyTransaction            = (YDB_AnyReadTransaction | YDB_AnyReadWriteTransaction),         // 001111
+	
+	YDB_MainThreadOnly            = 1 << 4,                                                         // 010000
+};
+#endif
+
+typedef NS_OPTIONS(NSUInteger, YapDatabaseConnectionFlushMemoryFlags) {
+	YapDatabaseConnectionFlushMemoryFlags_None       = 0,
+	YapDatabaseConnectionFlushMemoryFlags_Caches     = 1 << 0,
+	YapDatabaseConnectionFlushMemoryFlags_Statements = 1 << 1,
+	YapDatabaseConnectionFlushMemoryFlags_Internal   = 1 << 2,
+	YapDatabaseConnectionFlushMemoryFlags_All        = (YapDatabaseConnectionFlushMemoryFlags_Caches     |
+	                                                    YapDatabaseConnectionFlushMemoryFlags_Statements |
+	                                                    YapDatabaseConnectionFlushMemoryFlags_Internal   ),
+};
+
 
 
 @interface YapDatabaseConnection : NSObject
@@ -83,7 +119,7 @@ typedef enum {
  * @see YapDatabase defaultObjectCacheLimit
  * 
  * Also see the wiki for a bit more info:
- * https://github.com/yaptv/YapDatabase/wiki/Cache
+ * https://github.com/yapstudios/YapDatabase/wiki/Cache
 **/
 @property (atomic, assign, readwrite) BOOL objectCacheEnabled;
 @property (atomic, assign, readwrite) NSUInteger objectCacheLimit;
@@ -99,7 +135,7 @@ typedef enum {
  * To disable the metadata cache entirely, set metadataCacheEnabled to NO.
  * To use an inifinite cache size, set the metadataCacheLimit to zero.
  * 
- * By default the metadataCache is enabled and has a limit of 500.
+ * By default the metadataCache is enabled and has a limit of 250.
  * 
  * New connections will inherit the default values set by the parent database object.
  * Thus the default values for new connection instances are configurable.
@@ -108,7 +144,7 @@ typedef enum {
  * @see YapDatabase defaultMetadataCacheLimit
  *
  * Also see the wiki for a bit more info:
- * https://github.com/yaptv/YapDatabase/wiki/Cache
+ * https://github.com/yapstudios/YapDatabase/wiki/Cache
 **/
 @property (atomic, assign, readwrite) BOOL metadataCacheEnabled;
 @property (atomic, assign, readwrite) NSUInteger metadataCacheLimit;
@@ -127,10 +163,61 @@ typedef enum {
  * The other policies require a little more work, and little deeper understanding.
  *
  * These optimizations are discussed extensively in the wiki article "Performance Pro":
- * https://github.com/yaptv/YapDatabase/wiki/Performance-Pro
+ * https://github.com/yapstudios/YapDatabase/wiki/Performance-Pro
 **/
 @property (atomic, assign, readwrite) YapDatabasePolicy objectPolicy;
 @property (atomic, assign, readwrite) YapDatabasePolicy metadataPolicy;
+
+/**
+ * When architecting your application, you will likely create a few dedicated connections for particular uses.
+ * This property allows you to enforce only allowed transaction types for your dedicated connections.
+ *
+ * --- Example 1: ---
+ *
+ * You have a connection designed for use on the main thread which uses a longLivedReadTransaction.
+ * Ideally this connection has the following constraints:
+ * - May only be used on the main thread
+ * - Can only be used for synchronous read transactions
+ * 
+ * The idea is to ensure that a read transaction on the main thread never blocks.
+ * Thus you don't want background threads potentially tying up the connection.
+ * Remember: transactions go through a serial per-connection queue.
+ * And similarly, you don't want asynchronous operations of any kind. As that would be the equivalent of
+ * using the connection on a background thread.
+ * 
+ * To enforce this, you can do something like this within your app:
+ *
+ * uiDatabaseConnection.permittedTransactions = YDB_SyncReadTransaction | YDB_MainThreadOnly;
+ * [uiDatabaseConnection beginLongLivedReadTransaction];
+ * 
+ * --- Example 2: ---
+ * 
+ * You have a dedicated connection designed for read-only operations in background tasks.
+ * And you want to make sure that no read-write transactions are accidentally invoked on this connection,
+ * as that would slow your background tasks (which are designed to asynchronous, but generally very fast).
+ * 
+ * To enforce this, you can do something like this within your app:
+ * 
+ * roDatabaseConnection.permittedTransactions = YDB_AnyReadTransaction;
+ * 
+ * --- Example 3: ---
+ * 
+ * You have an internal databaseConnection within some highly asynchronous manager class.
+ * You've designed just about every method to be asynchronous,
+ * and you want to make sure you always remember to use asynchronous transactions.
+ * 
+ * So, for debugging purposes, you do something like this:
+ * 
+ * #if DEBUG
+ * databaseConnection.permittedTransactions = YBD_AnyAsyncTransaction;
+ * #endif
+ *
+ * 
+ * The default value is YDB_AnyTransaction.
+**/
+#if YapDatabaseEnforcePermittedTransactions
+@property (atomic, assign, readwrite) YapDatabasePermittedTransactions permittedTransactions;
+#endif
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 #pragma mark State
@@ -243,7 +330,7 @@ typedef enum {
  * The completionBlock will be invoked on the main thread (dispatch_get_main_queue()).
 **/
 - (void)asyncReadWithBlock:(void (^)(YapDatabaseReadTransaction *transaction))block
-           completionBlock:(dispatch_block_t)completionBlock;
+           completionBlock:(nullable dispatch_block_t)completionBlock;
 
 /**
  * Read-only access to the database.
@@ -258,8 +345,8 @@ typedef enum {
  * If NULL, dispatch_get_main_queue() is automatically used.
 **/
 - (void)asyncReadWithBlock:(void (^)(YapDatabaseReadTransaction *transaction))block
-           completionBlock:(dispatch_block_t)completionBlock
-           completionQueue:(dispatch_queue_t)completionQueue;
+           completionQueue:(nullable dispatch_queue_t)completionQueue
+           completionBlock:(nullable dispatch_block_t)completionBlock;
 
 /**
  * Read-write access to the database.
@@ -284,7 +371,7 @@ typedef enum {
  * The completionBlock will be invoked on the main thread (dispatch_get_main_queue()).
 **/
 - (void)asyncReadWriteWithBlock:(void (^)(YapDatabaseReadWriteTransaction *transaction))block
-                completionBlock:(dispatch_block_t)completionBlock;
+                completionBlock:(nullable dispatch_block_t)completionBlock;
 
 /**
  * Read-write access to the database.
@@ -300,8 +387,8 @@ typedef enum {
  * If NULL, dispatch_get_main_queue() is automatically used.
 **/
 - (void)asyncReadWriteWithBlock:(void (^)(YapDatabaseReadWriteTransaction *transaction))block
-                completionBlock:(dispatch_block_t)completionBlock
-                completionQueue:(dispatch_queue_t)completionQueue;
+                completionQueue:(nullable dispatch_queue_t)completionQueue
+                completionBlock:(nullable dispatch_block_t)completionBlock;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 #pragma mark Long-Lived Transactions
@@ -313,10 +400,10 @@ typedef enum {
  * This is most often used for connections that service the main thread for UI data.
  * 
  * For a complete discussion, please see the wiki page:
- * https://github.com/yaptv/YapDatabase/wiki/LongLivedReadTransactions
+ * https://github.com/yapstudios/YapDatabase/wiki/LongLivedReadTransactions
 **/
-- (NSArray *)beginLongLivedReadTransaction;
-- (NSArray *)endLongLivedReadTransaction;
+- (NSArray<NSNotification *> *)beginLongLivedReadTransaction;
+- (NSArray<NSNotification *> *)endLongLivedReadTransaction;
 
 - (BOOL)isInLongLivedReadTransaction;
 
@@ -330,7 +417,7 @@ typedef enum {
  * So its better to have an early warning system to help you fix the bug before it occurs.
  *
  * For a complete discussion, please see the wiki page:
- * https://github.com/yaptv/YapDatabase/wiki/LongLivedReadTransactions
+ * https://github.com/yapstudios/YapDatabase/wiki/LongLivedReadTransactions
  *
  * In debug mode (#if DEBUG), these exceptions are turned ON by default.
  * In non-debug mode (#if !DEBUG), these exceptions are turned OFF by default.
@@ -351,42 +438,102 @@ typedef enum {
  * This is most often used in conjunction with longLivedReadTransactions.
  *
  * For more information on longLivedReadTransaction, see the following wiki article:
- * https://github.com/yaptv/YapDatabase/wiki/LongLivedReadTransactions
+ * https://github.com/yapstudios/YapDatabase/wiki/LongLivedReadTransactions
 **/
 
 // Query for any change to a collection
 
-- (BOOL)hasChangeForCollection:(NSString *)collection inNotifications:(NSArray *)notifications;
-- (BOOL)hasObjectChangeForCollection:(NSString *)collection inNotifications:(NSArray *)notifications;
-- (BOOL)hasMetadataChangeForCollection:(NSString *)collection inNotifications:(NSArray *)notifications;
+- (BOOL)hasChangeForCollection:(NSString *)collection inNotifications:(NSArray<NSNotification *> *)notifications;
+- (BOOL)hasObjectChangeForCollection:(NSString *)collection inNotifications:(NSArray<NSNotification *> *)notifications;
+- (BOOL)hasMetadataChangeForCollection:(NSString *)collection inNotifications:(NSArray<NSNotification *> *)notifications;
 
 // Query for a change to a particular key/collection tuple
 
 - (BOOL)hasChangeForKey:(NSString *)key
            inCollection:(NSString *)collection
-        inNotifications:(NSArray *)notifications;
+        inNotifications:(NSArray<NSNotification *> *)notifications;
 
 - (BOOL)hasObjectChangeForKey:(NSString *)key
                  inCollection:(NSString *)collection
-              inNotifications:(NSArray *)notifications;
+              inNotifications:(NSArray<NSNotification *> *)notifications;
 
 - (BOOL)hasMetadataChangeForKey:(NSString *)key
                    inCollection:(NSString *)collection
-                inNotifications:(NSArray *)notifications;
+                inNotifications:(NSArray<NSNotification *> *)notifications;
 
 // Query for a change to a particular set of keys in a collection
 
 - (BOOL)hasChangeForAnyKeys:(NSSet *)keys
                inCollection:(NSString *)collection
-            inNotifications:(NSArray *)notifications;
+            inNotifications:(NSArray<NSNotification *> *)notifications;
 
 - (BOOL)hasObjectChangeForAnyKeys:(NSSet *)keys
                      inCollection:(NSString *)collection
-                  inNotifications:(NSArray *)notifications;
+                  inNotifications:(NSArray<NSNotification *> *)notifications;
 
 - (BOOL)hasMetadataChangeForAnyKeys:(NSSet *)keys
                        inCollection:(NSString *)collection
-                    inNotifications:(NSArray *)notifications;
+                    inNotifications:(NSArray<NSNotification *> *)notifications;
+
+// Advanced query techniques
+
+/**
+ * Returns YES if [transaction removeAllObjectsInCollection:] was invoked on the collection,
+ * or if [transaction removeAllObjectsInAllCollections] was invoked
+ * during any of the commits represented by the given notifications.
+ * 
+ * If this was the case then YapDatabase may not have tracked every single key within the collection.
+ * And thus a key that was removed via clearing the collection may not show up while enumerating changedKeys.
+ *
+ * This method is designed to be used in conjunction with the enumerateChangedKeys.... methods (below).
+ * The hasChange... methods (above) already take this into account.
+**/
+- (BOOL)didClearCollection:(NSString *)collection inNotifications:(NSArray<NSNotification *> *)notifications;
+
+/**
+ * Returns YES if [transaction removeAllObjectsInAllCollections] was invoked
+ * during any of the commits represented by the given notifications.
+ *
+ * If this was the case then YapDatabase may not have tracked every single key within every single collection.
+ * And thus a key that was removed via clearing the database may not show up while enumerating changedKeys.
+ *
+ * This method is designed to be used in conjunction with the enumerateChangedKeys.... methods (below).
+ * The hasChange... methods (above) already take this into account.
+**/
+- (BOOL)didClearAllCollectionsInNotifications:(NSArray<NSNotification *> *)notifications;
+
+/**
+ * Allows you to enumerate all the changed keys in the given collection, for the given commits.
+ * 
+ * Keep in mind that if [transaction removeAllObjectsInCollection:] was invoked on the given collection
+ * or [transaction removeAllObjectsInAllCollections] was invoked
+ * during any of the commits represented by the given notifications,
+ * then the key may not be included in the enumeration.
+ * You must use didClearCollection:inNotifications: or didClearAllCollectionsInNotifications:
+ * if you need to handle that case.
+ * 
+ * @see didClearCollection:inNotifications:
+ * @see didClearAllCollectionsInNotifications:
+**/
+- (void)enumerateChangedKeysInCollection:(NSString *)collection
+                         inNotifications:(NSArray<NSNotification *> *)notifications
+                              usingBlock:(void (^)(NSString *key, BOOL *stop))block;
+
+/**
+ * Allows you to enumerate all the changed collection/key tuples for the given commits.
+ * 
+ * Keep in mind that if [transaction removeAllObjectsInCollection:] was invoked on the given collection
+ * or [transaction removeAllObjectsInAllCollections] was invoked
+ * during any of the commits represented by the given notifications,
+ * then the collection/key tuple may not be included in the enumeration.
+ * You must use didClearCollection:inNotifications: or didClearAllCollectionsInNotifications:
+ * if you need to handle that case.
+ * 
+ * @see didClearCollection:inNotifications:
+ * @see didClearAllCollectionsInNotifications:
+**/
+- (void)enumerateChangedCollectionKeysInNotifications:(NSArray<NSNotification *> *)notifications
+                                           usingBlock:(void (^)(YapCollectionKey *ck, BOOL *stop))block;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 #pragma mark Extensions
@@ -405,8 +552,8 @@ typedef enum {
  * 
  * @see YapDatabase registerExtension:withName:
 **/
-- (id)extension:(NSString *)extensionName;
-- (id)ext:(NSString *)extensionName; // <-- Shorthand (same as extension: method)
+- (__kindof YapDatabaseExtensionConnection *)extension:(NSString *)extensionName;
+- (__kindof YapDatabaseExtensionConnection *)ext:(NSString *)extensionName; // <-- Shorthand (same as extension: method)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 #pragma mark Memory
@@ -418,30 +565,227 @@ typedef enum {
  * Depending upon how often you use the database connection,
  * you may want to be more or less aggressive on how much stuff you flush.
  *
- * YapDatabaseConnectionFlushMemoryLevelNone (0):
- *     No-op. Doesn't flush any caches or anything from internal memory.
+ * YapDatabaseConnectionFlushMemoryFlags_None:
+ *     No-op. Doesn't flush anything.
  * 
- * YapDatabaseConnectionFlushMemoryLevelMild (1):
- *     Flushes the object cache and metadata cache.
+ * YapDatabaseConnectionFlushMemoryFlags_Caches:
+ *     Flushes all caches, including the object cache and metadata cache.
  * 
- * YapDatabaseConnectionFlushMemoryLevelModerate (2):
- *     Mild plus drops less common pre-compiled sqlite statements.
+ * YapDatabaseConnectionFlushMemoryFlags_Statements:
+ *     Flushes all pre-compiled sqlite statements.
  * 
- * YapDatabaseConnectionFlushMemoryLevelFull (3):
- *     Full flush of all caches and removes all pre-compiled sqlite statements.
+ * YapDatabaseConnectionFlushMemoryFlags_Internal
+ *     Flushes internal memory used by sqlite instance via sqlite_db_release_memory.
+ *     Generally this means cached database pages.
+ * 
+ * YapDatabaseConnectionFlushMemoryFlags_All:
+ *     Full flush of everything (caches, statements, internal)
 **/
-- (void)flushMemoryWithLevel:(int)level;
+- (void)flushMemoryWithFlags:(YapDatabaseConnectionFlushMemoryFlags)flags;
 
 #if TARGET_OS_IPHONE
 /**
  * When a UIApplicationDidReceiveMemoryWarningNotification is received,
- * the code automatically invokes flushMemoryWithLevel and passes this set level.
+ * the code automatically invokes flushMemoryWithFlags and passes the set flags.
  * 
- * The default value is YapDatabaseConnectionFlushMemoryLevelMild.
+ * The default value is YapDatabaseConnectionFlushMemoryFlags_All.
  * 
- * @see flushMemoryWithLevel:
+ * @see flushMemoryWithFlags:
 **/
-@property (atomic, assign, readwrite) int autoFlushMemoryLevel;
+@property (atomic, assign, readwrite) YapDatabaseConnectionFlushMemoryFlags autoFlushMemoryFlags;
 #endif
 
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+#pragma mark Pragma
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+/**
+ * Returns the current synchronous configuration via "PRAGMA synchronous;".
+ * Allows you to verify that sqlite accepted your synchronous configuration request.
+**/
+- (NSString *)pragmaSynchronous;
+
+/**
+ * Returns the current page_size configuration via "PRAGMA page_size;".
+ * Allows you to verify that sqlite accepted your page_size configuration request.
+**/
+- (NSInteger)pragmaPageSize;
+
+/**
+ * Returns the currently memory mapped I/O configureation via "PRAGMA mmap_size;".
+ * Allows you to verify that sqlite accepted your mmap_size configuration request.
+ *
+ * Memory mapping may be disabled by sqlite's compile-time options.
+ * Or it may restrict the mmap_size to something smaller than requested.
+**/
+- (NSInteger)pragmaMMapSize;
+
+/**
+ * Upgrade Notice:
+ *
+ * The "auto_vacuum=FULL" was not properly set until YapDatabase v2.5.
+ * And thus if you have an app that was using YapDatabase prior to this version,
+ * then the existing database file will continue to operate in "auto_vacuum=NONE" mode.
+ * This means the existing database file won't be properly truncated as you delete information from the db.
+ * That is, the data will be removed, but the pages will be moved to the freelist,
+ * and the file itself will remain the same size on disk. (I.e. the file size can grow, but not shrink.)
+ * To correct this problem, you should run the vacuum operation at least once.
+ * After it is run, the "auto_vacuum=FULL" mode will be set,
+ * and the database file size will automatically shrink in the future (as you delete data).
+ * 
+ * @returns Result from "PRAGMA auto_vacuum;" command, as a readable string:
+ *   - NONE
+ *   - FULL
+ *   - INCREMENTAL
+ *   - UNKNOWN (future proofing)
+ * 
+ * If the return value is NONE, then you should run the vacuum operation at some point
+ * in order to properly reconfigure the database.
+ *
+ * Concerning Method Invocation:
+ *
+ * You can invoke this method as a standalone method on the connection:
+ * 
+ *   NSString *value = [databaseConnection pragmaAutoVacuum]
+ * 
+ * Or you can invoke this method within a transaction:
+ *
+ * [databaseConnection asyncReadWithBlock:^(YapDatabaseReadTransaction *transaction){
+ *     NSString *value = [databaseConnection pragmaAutoVacuum];
+ * }];
+**/
+- (NSString *)pragmaAutoVacuum;
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+#pragma mark Vacuum
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+/**
+ * Performs a VACUUM on the sqlite database.
+ * 
+ * This method operates as a synchronous ReadWrite "transaction".
+ * That is, it behaves in a similar fashion, and you may treat it as if it is a ReadWrite transaction.
+ * 
+ * For more infomation on the VACUUM operation, see the sqlite docs:
+ * http://sqlite.org/lang_vacuum.html
+ * 
+ * Remember that YapDatabase operates in WAL mode, with "auto_vacuum=FULL" set.
+ * 
+ * @see pragmaAutoVacuum
+**/
+- (void)vacuum;
+
+/**
+ * Performs a VACUUM on the sqlite database.
+ *
+ * This method operates as an asynchronous readWrite "transaction".
+ * That is, it behaves in a similar fashion, and you may treat it as if it is a ReadWrite transaction.
+ * 
+ * For more infomation on the VACUUM operation, see the sqlite docs:
+ * http://sqlite.org/lang_vacuum.html
+ *
+ * Remember that YapDatabase operates in WAL mode, with "auto_vacuum=FULL" set.
+ * 
+ * An optional completion block may be used.
+ * The completionBlock will be invoked on the main thread (dispatch_get_main_queue()).
+ * 
+ * @see pragmaAutoVacuum
+**/
+- (void)asyncVacuumWithCompletionBlock:(nullable dispatch_block_t)completionBlock;
+
+/**
+ * Performs a VACUUM on the sqlite database.
+ *
+ * This method operates as an asynchronous readWrite "transaction".
+ * That is, it behaves in a similar fashion, and you may treat it as if it is a ReadWrite transaction.
+ *
+ * For more infomation on the VACUUM operation, see the sqlite docs:
+ * http://sqlite.org/lang_vacuum.html
+ *
+ * Remember that YapDatabase operates in WAL mode, with "auto_vacuum=FULL" set.
+ *
+ * An optional completion block may be used.
+ * Additionally the dispatch_queue to invoke the completion block may also be specified.
+ * If NULL, dispatch_get_main_queue() is automatically used.
+ * 
+ * @see pragmaAutoVacuum
+**/
+- (void)asyncVacuumWithCompletionQueue:(nullable dispatch_queue_t)completionQueue
+                       completionBlock:(nullable dispatch_block_t)completionBlock;
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+#pragma mark Backup
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+/**
+ * This method backs up the database by exporting all the tables to another sqlite database.
+ * 
+ * This method operates as a synchronous ReadWrite "transaction".
+ * That is, it behaves in a similar fashion, and you may treat it as if it is a ReadWrite transaction.
+ * 
+ * The database will be backed up as it exists at the moment this transaction operates.
+ * That is, it will backup everything in the sqlite file, as well as everything in the WAL file.
+ *
+ * For more information on the BACKUP operation, see the sqlite docs:
+ * https://www.sqlite.org/c3ref/backup_finish.html
+ * 
+ * As stated in the sqlite docs, it is your responsibilty to ensure that nothing else is
+ * currently using the backupDatabase.
+**/
+- (NSError *)backupToPath:(NSString *)backupDatabasePath;
+
+/**
+ * This method backs up the database by exporting all the tables to another sqlite database.
+ *
+ * This method operates as an asynchronous readWrite "transaction".
+ * That is, it behaves in a similar fashion, and you may treat it as if it is a ReadWrite transaction.
+ * 
+ * The database will be backed up as it exists at the moment this transaction operates.
+ * That is, it will backup everything in the sqlite file, as well as everything in the WAL file.
+ * 
+ * An optional completion block may be used.
+ * The completionBlock will be invoked on the main thread (dispatch_get_main_queue()).
+ *
+ * For more information on the BACKUP operation, see the sqlite docs:
+ * https://www.sqlite.org/c3ref/backup_finish.html
+ *
+ * As stated in the sqlite docs, it is your responsibilty to ensure that nothing else is
+ * currently using the backupDatabase.
+ *
+ * @return
+ *   A NSProgress instance that may be used to track the backup progress.
+ *   The progress in cancellable, meaning that invoking [progress cancel] will abort the backup operation.
+**/
+- (NSProgress *)asyncBackupToPath:(NSString *)backupDatabasePath
+                  completionBlock:(nullable void (^)(NSError *error))completionBlock;
+
+/**
+ * This method backs up the database by exporting all the tables to another sqlite database.
+ *
+ * This method operates as an asynchronous readWrite "transaction".
+ * That is, it behaves in a similar fashion, and you may treat it as if it is a ReadWrite transaction.
+ *
+ * The database will be backed up as it exists at the moment this transaction operates.
+ * That is, it will backup everything in the sqlite file, as well as everything in the WAL file.
+ *
+ * An optional completion block may be used.
+ * Additionally the dispatch_queue to invoke the completion block may also be specified.
+ * If NULL, dispatch_get_main_queue() is automatically used.
+ *
+ * For more information on the BACKUP operation, see the sqlite docs:
+ * https://www.sqlite.org/c3ref/backup_finish.html
+ *
+ * As stated in the sqlite docs, it is your responsibilty to ensure that nothing else is
+ * currently using the backupDatabase.
+ *
+ * @return
+ *   A NSProgress instance that may be used to track the backup progress.
+ *   The progress in cancellable, meaning that invoking [progress cancel] will abort the backup operation.
+**/
+- (NSProgress *)asyncBackupToPath:(NSString *)backupDatabasePath
+                  completionQueue:(nullable dispatch_queue_t)completionQueue
+                  completionBlock:(nullable void (^)(NSError *))completionBlock;
+
 @end
+
+NS_ASSUME_NONNULL_END

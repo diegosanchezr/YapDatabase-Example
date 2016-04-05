@@ -2,11 +2,21 @@
 
 @class YapDatabaseSecondaryIndexColumn;
 
-typedef enum {
+NS_ASSUME_NONNULL_BEGIN
+
+/**
+ * For detailed information on sqlite datatypes & affinity:
+ * https://www.sqlite.org/datatype3.html
+**/
+typedef NS_ENUM(NSInteger, YapDatabaseSecondaryIndexType) {
 	YapDatabaseSecondaryIndexTypeInteger,
 	YapDatabaseSecondaryIndexTypeReal,
-	YapDatabaseSecondaryIndexTypeText
-} YapDatabaseSecondaryIndexType;
+	YapDatabaseSecondaryIndexTypeNumeric,
+	YapDatabaseSecondaryIndexTypeText,
+	YapDatabaseSecondaryIndexTypeBlob
+};
+
+NSString* NSStringFromYapDatabaseSecondaryIndexType(YapDatabaseSecondaryIndexType type);
 
 
 @interface YapDatabaseSecondaryIndexSetup : NSObject <NSCopying, NSFastEnumeration>
@@ -17,9 +27,9 @@ typedef enum {
 - (void)addColumn:(NSString *)name withType:(YapDatabaseSecondaryIndexType)type;
 
 - (NSUInteger)count;
-- (YapDatabaseSecondaryIndexColumn *)columnAtIndex:(NSUInteger)index;
+- (nullable YapDatabaseSecondaryIndexColumn *)columnAtIndex:(NSUInteger)index;
 
-- (NSArray *)columnNames;
+- (NSArray<NSString *> *)columnNames;
 
 @end
 
@@ -31,3 +41,5 @@ typedef enum {
 @property (nonatomic, assign, readonly) YapDatabaseSecondaryIndexType type;
 
 @end
+
+NS_ASSUME_NONNULL_END
