@@ -20,6 +20,7 @@ NSString *const TJLTableViewCollectionName = @"TableViewModelCollection";
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         _sharedYapDatabase = [[YapDatabase alloc]initWithPath:self.filePath];
+        _sharedYapDatabase.connectionPoolLifetime = 2;
     });
 
     return _sharedYapDatabase;
@@ -32,20 +33,47 @@ NSString *const TJLTableViewCollectionName = @"TableViewModelCollection";
     YapDatabaseConnection *connection = [self.database newConnection];
 
     [connection readWriteWithBlock:^(YapDatabaseReadWriteTransaction *transaction) {
-        [transaction removeAllObjectsInAllCollections]; ///Remove everything each time we write, as this is just an example
-        for(NSInteger i = 0; i < 20; i++) {
-            TJLTestModel *model = [[TJLTestModel alloc]
-                    initWithName:[NSString stringWithFormat:@"joe%u", arc4random_uniform(100)]
-                        subtitle:[NSString stringWithFormat:@"bob%u", arc4random_uniform(100)]];
-            [transaction
-                    setObject:model
-                       forKey:[NSString stringWithFormat:@"%u", i]
-                 inCollection:TJLTableViewCollectionName];
-        }
+        [transaction removeAllObjectsInAllCollections];
     }];
+    [self writeInDb];
+    [NSTimer scheduledTimerWithTimeInterval:7 target:self selector:@selector(writeInDb) userInfo:nil repeats:YES];
 
     return YES;
 }
+
+- (void)writeInDb {
+    YapDatabaseConnection *connection = [self.database newConnection];
+
+    [connection readWriteWithBlock:^(YapDatabaseReadWriteTransaction *transaction) {
+        for(NSInteger i = 0; i < 20; i++) {
+            TJLTestModel *model = [[TJLTestModel alloc]
+                                   initWithName:[NSString stringWithFormat:@"joe%u", arc4random_uniform(100)]
+                                   subtitle:[NSString stringWithFormat:@"bob%u", arc4random_uniform(100)]];
+            [transaction
+             setObject:model
+             forKey:[NSString stringWithFormat:@"%u", i]
+             inCollection:TJLTableViewCollectionName];
+        }
+    }];
+}
+
+- (void)writeInDb2 {
+    YapDatabaseConnection *connection = [self.database newConnection];
+
+    [connection readWriteWithBlock:^(YapDatabaseReadWriteTransaction *transaction) {
+        for(NSInteger i = 0; i < 20; i++) {
+            TJLTestModel *model = [[TJLTestModel alloc]
+                                   initWithName:[NSString stringWithFormat:@"joe%u", arc4random_uniform(100)]
+                                   subtitle:[NSString stringWithFormat:@"bob%u", arc4random_uniform(100)]];
+            [transaction
+             setObject:model
+             forKey:[NSString stringWithFormat:@"%u", i]
+             inCollection:TJLTableViewCollectionName];
+        }
+    }];
+}
+
+
 
 - (NSString *)filePath {
     NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
@@ -76,28 +104,22 @@ NSString *const TJLTableViewCollectionName = @"TableViewModelCollection";
 }
 
 - (YapDatabaseView *)setupDatabaseView {
-    YapDatabaseViewBlockType groupingBlockType;
-    YapDatabaseViewGroupingWithObjectBlock groupingBlock;
-
-    YapDatabaseViewBlockType sortingBlockType;
-    YapDatabaseViewSortingWithObjectBlock sortingBlock;
-
-    groupingBlockType = YapDatabaseViewBlockTypeWithObject;
-    groupingBlock = ^NSString *(NSString *collection, NSString *key, id object) {
+    YapDatabaseViewGrouping *viewGrouping = [YapDatabaseViewGrouping withKeyBlock:^NSString * _Nullable(YapDatabaseReadTransaction * _Nonnull transaction, NSString * _Nonnull collection, NSString * _Nonnull key) {
         return @"name";
-    };
+    }];
 
-    sortingBlockType = YapDatabaseViewBlockTypeWithObject;
-    sortingBlock = ^(NSString *group, NSString *collection1, NSString *key1, TJLTestModel *obj1,
-            NSString *collection2, NSString *key2, TJLTestModel *obj2) {
-        return [obj1.name compare:obj2.name options:NSNumericSearch range:NSMakeRange(0, obj1.name.length)];
-    };
+    YapDatabaseViewSorting *viewSorting = [YapDatabaseViewSorting withObjectBlock:^NSComparisonResult(YapDatabaseReadTransaction * _Nonnull transaction, NSString * _Nonnull group, NSString * _Nonnull collection1, NSString * _Nonnull key1, TJLTestModel *_Nonnull object1, NSString * _Nonnull collection2, NSString * _Nonnull key2, TJLTestModel *_Nonnull object2) {
+        NSUInteger minLength = MIN(object1.name.length, object2.name.length);
+        return [object1.name compare:object2.name options:NSNumericSearch range:NSMakeRange(0, minLength)];
+    }];
 
-    YapDatabaseView *databaseView =
-            [[YapDatabaseView alloc]initWithGroupingBlock:groupingBlock
-                                        groupingBlockType:groupingBlockType
-                                             sortingBlock:sortingBlock
-                                         sortingBlockType:sortingBlockType];
+//    sortingBlockType = YapDatabaseBlockTypeWithObject;
+//    sortingBlock = ^(NSString *group, NSString *collection1, NSString *key1, TJLTestModel *obj1,
+//            NSString *collection2, NSString *key2, TJLTestModel *obj2) {
+//        return [obj1.name compare:obj2.name options:NSNumericSearch range:NSMakeRange(0, obj1.name.length)];
+//    };
+
+    YapDatabaseView *databaseView = [[YapDatabaseView alloc] initWithGrouping:viewGrouping sorting:viewSorting];
     return databaseView;
 }
 

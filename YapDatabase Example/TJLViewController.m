@@ -23,17 +23,32 @@
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = @"YapDatabase Example";
-    TJLAppDelegate *delegate = (TJLAppDelegate *)[UIApplication sharedApplication].delegate;
+
     self.tableView.dataSource = self;
-
-    self.connection = [delegate.database newConnection];
-
-    [self.connection beginLongLivedReadTransaction];
     self.mappings = [[YapDatabaseViewMappings alloc]initWithGroups:@[@"name"] view:TJLTableViewViewName];
 
+    [NSTimer scheduledTimerWithTimeInterval:0.5 target:self selector:@selector(setupConnection) userInfo:nil repeats:NO];
+}
+
+- (void)setupConnection {
+    TJLAppDelegate *delegate = (TJLAppDelegate *)[UIApplication sharedApplication].delegate;
+    self.connection = [delegate.database newConnection];
+    [self.connection beginLongLivedReadTransaction];
     [self.connection readWithBlock:^(YapDatabaseReadTransaction *transaction) {
         [self.mappings updateWithTransaction:transaction];
     }];
+
+    [self readFromDb];
+
+    [NSTimer scheduledTimerWithTimeInterval:0.1 target:self selector:@selector(readFromDb) userInfo:nil repeats:YES];
+}
+
+- (void)readFromDb {
+    [self.connection beginLongLivedReadTransaction];
+    [self.connection readWithBlock:^(YapDatabaseReadTransaction *transaction) {
+        [self.mappings updateWithTransaction:transaction];
+    }];
+    [self.tableView reloadData];
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
